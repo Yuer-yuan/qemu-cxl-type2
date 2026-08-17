@@ -26,6 +26,7 @@
 #include "accel/tcg/probe.h"
 #include "exec/helper-proto.h"
 #include "exec/tlb-flags.h"
+#include "system/memory.h"
 #include "trace.h"
 
 /* Exceptions processing helpers */
@@ -210,13 +211,15 @@ void helper_cbo_zero(CPURISCVState *env, target_ulong address)
  */
 static void check_zicbom_access(CPURISCVState *env,
                                 target_ulong address,
-                                uintptr_t ra)
+                                uintptr_t ra, hwaddr *physical,
+                                MemTxAttrs *attrs)
 {
     RISCVCPU *cpu = env_archcpu(env);
+    CPUState *cs = env_cpu(env);
     int mmu_idx = riscv_env_mmu_index(env, false);
     uint16_t cbomlen = cpu->cfg.cbom_blocksize;
-    void *phost;
-    int ret;
+    hwaddr tlb_size;
+    int prot;
 
     /* Mask off low-bits to align-down to the cache-block. */
     address &= ~(cbomlen - 1);
@@ -233,38 +236,64 @@ static void check_zicbom_access(CPURISCVState *env,
      * addresses, whether a cache-block management instruction is
      * permitted to access the cache block is UNSPECIFIED."
      */
-    ret = probe_access_flags(env, address, cbomlen, MMU_DATA_LOAD,
-                             mmu_idx, true, &phost, ra);
-    if (ret != TLB_INVALID_MASK) {
-        /* Success: readable */
-        return;
+    if (!riscv_cpu_mmu_translate(cs, address, cbomlen, MMU_DATA_LOAD,
+                                 mmu_idx, true, ra, physical, &prot,
+                                 &tlb_size)) {
+        /*
+         * Since not readable, it must be writable.  A failure raises the
+         * same store/PMP fault as the ordinary TLB-fill path.
+         */
+        riscv_cpu_mmu_translate(cs, address, cbomlen, MMU_DATA_STORE,
+                                mmu_idx, false, ra, physical, &prot,
+                                &tlb_size);
     }
-
-    /*
-     * Since not readable, must be writable. On failure, store
-     * fault/store guest amo fault will be raised by
-     * riscv_cpu_tlb_fill(). PMP exceptions will be caught
-     * there as well.
-     */
-    probe_write(env, address, cbomlen, mmu_idx, ra);
+    *attrs = MEMTXATTRS_UNSPECIFIED;
 }
 
-void helper_cbo_clean_flush(CPURISCVState *env, target_ulong address)
+static void riscv_cbo_memory_operation(
+    CPURISCVState *env, target_ulong address,
+    MemoryRegionCacheBlockOperation operation, uintptr_t ra)
+{
+    CPUState *cs = env_cpu(env);
+    RISCVCPU *cpu = env_archcpu(env);
+    int mmu_idx = riscv_env_mmu_index(env, false);
+    hwaddr physical;
+    MemTxAttrs attrs;
+    MemTxResult result;
+
+    check_zicbom_access(env, address, ra, &physical, &attrs);
+    result = address_space_cache_block(
+        cpu_get_address_space(cs, cpu_asidx_from_attrs(cs, attrs)),
+        physical, attrs, operation);
+    if (result != MEMTX_OK) {
+        riscv_cpu_do_transaction_failed(
+            cs, physical, address, cpu->cfg.cbom_blocksize,
+            MMU_DATA_STORE, mmu_idx, attrs, result, ra);
+    }
+}
+
+void helper_cbo_clean(CPURISCVState *env, target_ulong address)
 {
     uintptr_t ra = GETPC();
     check_zicbo_envcfg(env, MENVCFG_CBCFE, ra);
-    check_zicbom_access(env, address, ra);
+    riscv_cbo_memory_operation(env, address,
+                               MEMORY_REGION_CACHE_BLOCK_CLEAN, ra);
+}
 
-    /* We don't emulate the cache-hierarchy, so we're done. */
+void helper_cbo_flush(CPURISCVState *env, target_ulong address)
+{
+    uintptr_t ra = GETPC();
+    check_zicbo_envcfg(env, MENVCFG_CBCFE, ra);
+    riscv_cbo_memory_operation(env, address,
+                               MEMORY_REGION_CACHE_BLOCK_FLUSH, ra);
 }
 
 void helper_cbo_inval(CPURISCVState *env, target_ulong address)
 {
     uintptr_t ra = GETPC();
     check_zicbo_envcfg(env, MENVCFG_CBIE, ra);
-    check_zicbom_access(env, address, ra);
-
-    /* We don't emulate the cache-hierarchy, so we're done. */
+    riscv_cbo_memory_operation(env, address,
+                               MEMORY_REGION_CACHE_BLOCK_INVALIDATE, ra);
 }
 
 #ifndef CONFIG_USER_ONLY

@@ -228,7 +228,8 @@ static void sifive_u_build_rhct(GArray *table_data, BIOSLinker *linker,
         .oem_table_id = sifive_u_acpi_oem_table_id,
     };
     g_autofree char *isa = riscv_isa_string(cpu);
-    uint32_t isa_offset;
+    uint32_t isa_offset, cmo_offset = 0;
+    uint32_t num_nodes;
     size_t len = 8 + strlen(isa) + 1;
     size_t aligned_len = (len % 2) ? len + 1 : len;
     int i;
@@ -236,8 +237,11 @@ static void sifive_u_build_rhct(GArray *table_data, BIOSLinker *linker,
     acpi_table_begin(&table, table_data);
     build_append_int_noprefix(table_data, 0, 4);
     build_append_int_noprefix(table_data, 1000000, 8);
-    build_append_int_noprefix(
-        table_data, 1 + ms->smp.cpus - SIFIVE_U_MANAGEMENT_CPU_COUNT, 4);
+    num_nodes = 1 + ms->smp.cpus - SIFIVE_U_MANAGEMENT_CPU_COUNT;
+    if (cpu->cfg.ext_zicbom || cpu->cfg.ext_zicboz) {
+        num_nodes++;
+    }
+    build_append_int_noprefix(table_data, num_nodes, 4);
     build_append_int_noprefix(
         table_data, SIFIVE_U_RHCT_NODE_ARRAY_OFFSET, 4);
 
@@ -251,13 +255,35 @@ static void sifive_u_build_rhct(GArray *table_data, BIOSLinker *linker,
         build_append_int_noprefix(table_data, 0, 1);
     }
 
+    /* Cache-management-operation node.  Linux requires the block size from
+     * RHCT before it enables Zicbom on an ACPI-booted RISC-V machine. */
+    if (cpu->cfg.ext_zicbom || cpu->cfg.ext_zicboz) {
+        cmo_offset = table_data->len - table.table_offset;
+        build_append_int_noprefix(table_data, 1, 2);
+        build_append_int_noprefix(table_data, 10, 2);
+        build_append_int_noprefix(table_data, 1, 2);
+        build_append_int_noprefix(table_data, 0, 1);
+        build_append_int_noprefix(
+            table_data,
+            cpu->cfg.cbom_blocksize ? __builtin_ctz(cpu->cfg.cbom_blocksize) : 0,
+            1);
+        build_append_int_noprefix(table_data, 0, 1);
+        build_append_int_noprefix(
+            table_data,
+            cpu->cfg.cboz_blocksize ? __builtin_ctz(cpu->cfg.cboz_blocksize) : 0,
+            1);
+    }
+
     for (i = SIFIVE_U_MANAGEMENT_CPU_COUNT; i < ms->smp.cpus; i++) {
         build_append_int_noprefix(table_data, 0xffff, 2);
-        build_append_int_noprefix(table_data, 16, 2);
+        build_append_int_noprefix(table_data, cmo_offset ? 20 : 16, 2);
         build_append_int_noprefix(table_data, 1, 2);
-        build_append_int_noprefix(table_data, 1, 2);
+        build_append_int_noprefix(table_data, cmo_offset ? 2 : 1, 2);
         build_append_int_noprefix(table_data, i, 4);
         build_append_int_noprefix(table_data, isa_offset, 4);
+        if (cmo_offset) {
+            build_append_int_noprefix(table_data, cmo_offset, 4);
+        }
     }
 
     acpi_table_end(linker, &table);

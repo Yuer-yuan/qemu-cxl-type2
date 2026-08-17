@@ -595,15 +595,53 @@ typedef struct TCGIOMMUNotifier {
     bool active;
 } TCGIOMMUNotifier;
 
+static void tcg_iommu_flush_work(CPUState *cpu, run_on_cpu_data data)
+{
+    (void)data;
+    tlb_flush(cpu);
+}
+
+static void tcg_iommu_flush_sync(CPUState *cpu)
+{
+    bool need_bql;
+
+    if (qemu_cpu_is_self(cpu)) {
+        tlb_flush(cpu);
+        return;
+    }
+
+    /*
+     * tlb_flush() mutates per-vCPU TCG state and must execute on that vCPU.
+     * IOMMU invalidations normally arrive with the BQL held; CXL back
+     * invalidations can instead arrive on the CXLMemSim progress thread or a
+     * different MTTCG vCPU.  Enter the BQL before run_on_cpu(): besides being
+     * the API's required wait lock, it closes the wakeup race with a halted
+     * target between cpu_thread_is_idle() and qemu_cond_wait().  run_on_cpu()
+     * releases the BQL while waiting, so a target blocked in a CXL transaction
+     * can service the queued work through the wait-service hook.
+     */
+    need_bql = !bql_locked();
+    if (need_bql) {
+        bql_lock();
+    }
+    run_on_cpu(cpu, tcg_iommu_flush_work, RUN_ON_CPU_NULL);
+    if (need_bql) {
+        bql_unlock();
+    }
+}
+
 static void tcg_iommu_unmap_notify(IOMMUNotifier *n, IOMMUTLBEntry *iotlb)
 {
     TCGIOMMUNotifier *notifier = container_of(n, TCGIOMMUNotifier, n);
 
-    if (!notifier->active) {
+    /* Claim the mappings installed since the preceding flush.  A concurrent
+     * registration stores true after this exchange and is therefore claimed
+     * by the next invalidation; two concurrent notifications need not flush
+     * the same pre-existing TLB entries twice. */
+    if (!qatomic_xchg(&notifier->active, false)) {
         return;
     }
-    tlb_flush(notifier->cpu);
-    notifier->active = false;
+    tcg_iommu_flush_sync(notifier->cpu);
     /* We leave the notifier struct on the list to avoid reallocating it later.
      * Generally the number of IOMMUs a CPU deals with will be small.
      * In any case we can't unregister the iommu notifier from a notify
@@ -654,9 +692,7 @@ static void tcg_register_iommu_notifier(CPUState *cpu,
                                               &error_fatal);
     }
 
-    if (!notifier->active) {
-        notifier->active = true;
-    }
+    qatomic_store_release(&notifier->active, true);
 }
 
 void tcg_iommu_free_notifier_list(CPUState *cpu)
@@ -682,7 +718,8 @@ void tcg_iommu_init_notifier_list(CPUState *cpu)
 MemoryRegionSection *
 address_space_translate_for_iotlb(CPUState *cpu, int asidx, hwaddr orig_addr,
                                   hwaddr *xlat, hwaddr *plen,
-                                  MemTxAttrs attrs, int *prot)
+                                  MemTxAttrs attrs, int *prot,
+                                  int access_type)
 {
     MemoryRegionSection *section;
     IOMMUMemoryRegion *iommu_mr;
@@ -696,18 +733,62 @@ address_space_translate_for_iotlb(CPUState *cpu, int asidx, hwaddr orig_addr,
         section = address_space_translate_internal(d, addr, &addr, plen, false);
 
         iommu_mr = memory_region_get_iommu(section->mr);
-        if (!iommu_mr) {
+        if (iommu_mr) {
+            imrc = memory_region_get_iommu_class_nocheck(iommu_mr);
+            iommu_idx = imrc->attrs_to_index ?
+                imrc->attrs_to_index(iommu_mr, attrs) : 0;
+            tcg_register_iommu_notifier(cpu, iommu_mr, iommu_idx);
+            /* We need all permissions from ordinary IOMMUs. */
+            iotlb = imrc->translate(iommu_mr, addr, IOMMU_NONE, iommu_idx);
+        } else if (section->mr->ops && section->mr->ops->map_tcg) {
+            IOMMUAccessFlags flag;
+            IOMMUMemoryRegion *notifier = NULL;
+            IOMMUMemoryRegion *registered_notifier = NULL;
+            MemTxResult result;
+
+            if (access_type == MMU_DATA_STORE) {
+                flag = IOMMU_WO;
+            } else if (access_type == MMU_DATA_LOAD ||
+                       access_type == MMU_INST_FETCH) {
+                flag = IOMMU_RO;
+            } else {
+                flag = (*prot & PAGE_WRITE) ? IOMMU_WO : IOMMU_RO;
+            }
+
+            if (section->mr->ops->map_tcg_notifier) {
+                registered_notifier =
+                    section->mr->ops->map_tcg_notifier(section->mr->opaque,
+                                                        addr);
+                if (registered_notifier) {
+                    tcg_register_iommu_notifier(cpu, registered_notifier, 0);
+                }
+            }
+            memset(&iotlb, 0, sizeof(iotlb));
+            result = section->mr->ops->map_tcg(section->mr->opaque, addr,
+                                               flag, &notifier, &iotlb);
+            if (result != MEMTX_OK) {
+                *prot = 0;
+                goto translate_fail;
+            }
+            if (!iotlb.target_as) {
+                break;
+            }
+            if (!notifier) {
+                *prot = 0;
+                goto translate_fail;
+            }
+            if (notifier != registered_notifier) {
+                *prot = 0;
+                goto translate_fail;
+            }
+            /* Re-arm after acquiring the grant.  If a concurrent invalidation
+             * already claimed the notifier, its queued vCPU flush runs after
+             * this translation is installed; otherwise the next invalidation
+             * claims this mapping. */
+            tcg_register_iommu_notifier(cpu, notifier, 0);
+        } else {
             break;
         }
-
-        imrc = memory_region_get_iommu_class_nocheck(iommu_mr);
-
-        iommu_idx = imrc->attrs_to_index(iommu_mr, attrs);
-        tcg_register_iommu_notifier(cpu, iommu_mr, iommu_idx);
-        /* We need all the permissions, so pass IOMMU_NONE so the IOMMU
-         * doesn't short-cut its translation table walk.
-         */
-        iotlb = imrc->translate(iommu_mr, addr, IOMMU_NONE, iommu_idx);
         addr = ((iotlb.translated_addr & ~iotlb.addr_mask)
                 | (addr & iotlb.addr_mask));
         /* Update the caller's prot bits to remove permissions the IOMMU
@@ -3153,6 +3234,32 @@ MemTxResult address_space_write(AddressSpace *as, hwaddr addr,
         result = flatview_write(fv, addr, attrs, buf, len);
     }
 
+    return result;
+}
+
+MemTxResult address_space_cache_block(
+    AddressSpace *as, hwaddr addr, MemTxAttrs attrs,
+    MemoryRegionCacheBlockOperation operation)
+{
+    MemTxResult result = MEMTX_OK;
+    hwaddr length = 1;
+    hwaddr mr_addr;
+    MemoryRegion *mr;
+    FlatView *fv;
+    bool release_lock;
+
+    RCU_READ_LOCK_GUARD();
+    fv = address_space_to_flatview(as);
+    mr = flatview_translate(fv, addr, &mr_addr, &length, false, attrs);
+    if (!flatview_access_allowed(mr, attrs, mr_addr, 1)) {
+        return MEMTX_ACCESS_ERROR;
+    }
+    release_lock = prepare_mmio_access(mr);
+    result = memory_region_dispatch_cache_block(mr, mr_addr, operation,
+                                                attrs);
+    if (release_lock) {
+        bql_unlock();
+    }
     return result;
 }
 
