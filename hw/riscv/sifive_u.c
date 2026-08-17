@@ -96,7 +96,7 @@ const MemMapEntry sifive_u_memmap[] = {
     [SIFIVE_U_DEV_FW_CFG] =         { 0x10100000,        0x18 },
     [SIFIVE_U_DEV_PCIE_MMIO_HIGH] = { 0x400000000ULL, 16 * GiB },
     [SIFIVE_U_DEV_CXL_HOST_REG] =   { 0x800000000ULL,  1 * MiB },
-    [SIFIVE_U_DEV_CXL_FMW] =        { 0x1000000000ULL, 4 * GiB },
+    [SIFIVE_U_DEV_CXL_FMW] =        { 0x1000000000ULL, 64 * GiB },
 };
 
 #define OTP_SERIAL          1
@@ -755,7 +755,7 @@ static void sifive_u_create_cxl_regions(SiFiveUState *s)
                             &configured_size) ||
             configured_size > fmw_size) {
             error_report(
-                "sifive_u CXL: fixed windows exceed 4 GiB aperture");
+                "sifive_u CXL: fixed windows exceed 64 GiB aperture");
             exit(EXIT_FAILURE);
         }
     }

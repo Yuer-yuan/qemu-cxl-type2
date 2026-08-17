@@ -17,7 +17,7 @@
 #define SIFIVE_U_FW_CFG_DATA     0x10100000ULL
 #define SIFIVE_U_FW_CFG_SELECTOR (SIFIVE_U_FW_CFG_DATA + 8)
 #define SIFIVE_U_CXL_FMW_BASE    0x1000000000ULL
-#define SIFIVE_U_CXL_FMW_SIZE    (4ULL * GiB)
+#define SIFIVE_U_CXL_FMW_SIZE    (64ULL * GiB)
 #define SIFIVE_U_CXL_MMIO64_BASE 0x400000000ULL
 #define SIFIVE_U_CXL_MMIO64_SIZE (4ULL * GiB)
 #define SIFIVE_U_CXL_CHBS_BASE   0x800000000ULL
@@ -397,7 +397,7 @@ static void test_firmware_files(void)
 
     qts = qtest_init(
         "-machine sifive_u,cxl=on -cpu veyron-v1 -smp 5 "
-        "-machine cxl-fmw.0.targets.0=cxl.1,cxl-fmw.0.size=4G,"
+        "-machine cxl-fmw.0.targets.0=cxl.1,cxl-fmw.0.size=64G,"
         "cxl-fmw.0.restrictions=0x29 "
         "-object memory-backend-ram,id=t3mem,size=256M,share=on "
         "-object memory-backend-ram,id=t3lsa,size=2M,share=on "
