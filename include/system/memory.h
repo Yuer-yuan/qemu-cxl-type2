@@ -290,6 +290,12 @@ static inline void iommu_notifier_init(IOMMUNotifier *n, IOMMUNotify fn,
 /*
  * Memory region callbacks
  */
+typedef enum MemoryRegionCacheBlockOperation {
+    MEMORY_REGION_CACHE_BLOCK_CLEAN,
+    MEMORY_REGION_CACHE_BLOCK_FLUSH,
+    MEMORY_REGION_CACHE_BLOCK_INVALIDATE,
+} MemoryRegionCacheBlockOperation;
+
 struct MemoryRegionOps {
     /* Read from the memory region. @addr is relative to @mr; @size is
      * in bytes. */
@@ -313,6 +319,17 @@ struct MemoryRegionOps {
                                     uint64_t data,
                                     unsigned size,
                                     MemTxAttrs attrs);
+
+    /* Perform one architectural cache-block operation. Regions that do not
+     * model a cache may leave this callback unset. */
+    MemTxResult (*cache_block)(void *opaque, hwaddr addr,
+                               MemoryRegionCacheBlockOperation operation,
+                               MemTxAttrs attrs);
+
+    /* Complete the persistence-domain handoff for cache-block operations
+     * previously accepted by this region. The architectural memory fence
+     * invokes this callback once per pending region, not once per block. */
+    MemTxResult (*persist)(void *opaque);
 
     enum device_endian endianness;
     /* Guest-visible constraints: */
@@ -2702,6 +2719,10 @@ MemTxResult memory_region_dispatch_write(MemoryRegion *mr,
                                          MemOp op,
                                          MemTxAttrs attrs);
 
+MemTxResult memory_region_dispatch_cache_block(
+    MemoryRegion *mr, hwaddr addr,
+    MemoryRegionCacheBlockOperation operation, MemTxAttrs attrs);
+
 /**
  * address_space_init: initializes an address space
  *
@@ -2767,6 +2788,21 @@ MemTxResult address_space_rw(AddressSpace *as, hwaddr addr,
 MemTxResult address_space_write(AddressSpace *as, hwaddr addr,
                                 MemTxAttrs attrs,
                                 const void *buf, hwaddr len);
+
+/**
+ * address_space_cache_block: perform one architectural cache-block operation.
+ *
+ * RAM and devices without a cache model treat the operation as complete.
+ */
+MemTxResult address_space_cache_block(
+    AddressSpace *as, hwaddr addr, MemTxAttrs attrs,
+    MemoryRegionCacheBlockOperation operation);
+
+/**
+ * memory_region_persist_pending: complete all persistence providers dirtied
+ * by preceding architectural cache-block operations.
+ */
+MemTxResult memory_region_persist_pending(void);
 
 /**
  * address_space_write_rom: write to address space, including ROM.

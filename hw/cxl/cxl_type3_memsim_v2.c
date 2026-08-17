@@ -155,3 +155,34 @@ MemTxResult cxl_type3_memsim_v2_write(CxlType3MemsimV2 *state,
     }
     return MEMTX_OK;
 }
+
+MemTxResult cxl_type3_memsim_v2_cache_block(CxlType3MemsimV2 *state,
+                                            uint64_t dpa)
+{
+    Error *local_err = NULL;
+
+    if (!state || !state->enabled || !state->client ||
+        !cxl_memsim_v2_cache_block(state->client, dpa,
+                                   state->config.timeout_ms, &local_err)) {
+        if (local_err) {
+            error_report_err(local_err);
+        }
+        return MEMTX_ERROR;
+    }
+    return MEMTX_OK;
+}
+
+MemTxResult cxl_type3_memsim_v2_persist(CxlType3MemsimV2 *state)
+{
+    Error *local_err = NULL;
+
+    if (!state || !state->enabled || !state->client ||
+        !cxl_memsim_v2_fence(state->client, state->config.timeout_ms,
+                              &local_err)) {
+        if (local_err) {
+            error_report_err(local_err);
+        }
+        return MEMTX_ERROR;
+    }
+    return MEMTX_OK;
+}

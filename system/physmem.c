@@ -3156,6 +3156,32 @@ MemTxResult address_space_write(AddressSpace *as, hwaddr addr,
     return result;
 }
 
+MemTxResult address_space_cache_block(
+    AddressSpace *as, hwaddr addr, MemTxAttrs attrs,
+    MemoryRegionCacheBlockOperation operation)
+{
+    hwaddr length = 1;
+    hwaddr mr_addr;
+    MemoryRegion *mr;
+    FlatView *fv;
+    bool release_lock;
+    MemTxResult result;
+
+    RCU_READ_LOCK_GUARD();
+    fv = address_space_to_flatview(as);
+    mr = flatview_translate(fv, addr, &mr_addr, &length, false, attrs);
+    if (!flatview_access_allowed(mr, attrs, mr_addr, 1)) {
+        return MEMTX_ACCESS_ERROR;
+    }
+    release_lock = prepare_mmio_access(mr);
+    result = memory_region_dispatch_cache_block(mr, mr_addr, operation,
+                                                attrs);
+    if (release_lock) {
+        bql_unlock();
+    }
+    return result;
+}
+
 MemTxResult address_space_rw(AddressSpace *as, hwaddr addr, MemTxAttrs attrs,
                              void *buf, hwaddr len, bool is_write)
 {

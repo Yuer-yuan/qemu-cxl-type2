@@ -287,9 +287,70 @@ static MemTxResult cxl_write_cfmws(void *opaque, hwaddr addr,
     return cxl_type3_write(d, addr + fw->base, data, size, attrs);
 }
 
+static void cxl_fmw_queue_persist(CXLFixedWindow *fw, PCIDevice *d)
+{
+    size_t i;
+
+    g_mutex_lock(&fw->persist_lock);
+    for (i = 0; i < fw->persist_devices->len; i++) {
+        if (g_ptr_array_index(fw->persist_devices, i) == d) {
+            g_mutex_unlock(&fw->persist_lock);
+            return;
+        }
+    }
+    object_ref(OBJECT(d));
+    g_ptr_array_add(fw->persist_devices, d);
+    g_mutex_unlock(&fw->persist_lock);
+}
+
+static MemTxResult cxl_cache_block_cfmws(
+    void *opaque, hwaddr addr, MemoryRegionCacheBlockOperation operation,
+    MemTxAttrs attrs)
+{
+    CXLFixedWindow *fw = opaque;
+    PCIDevice *d = cxl_cfmws_find_device(fw, addr);
+    MemTxResult result;
+
+    if (!d) {
+        return MEMTX_ERROR;
+    }
+    result = cxl_type3_cache_block(d, addr + fw->base, operation, attrs);
+    if (result == MEMTX_OK &&
+        operation != MEMORY_REGION_CACHE_BLOCK_INVALIDATE) {
+        cxl_fmw_queue_persist(fw, d);
+    }
+    return result;
+}
+
+static MemTxResult cxl_persist_cfmws(void *opaque)
+{
+    CXLFixedWindow *fw = opaque;
+    GPtrArray *devices;
+    MemTxResult result = MEMTX_OK;
+    size_t i;
+
+    g_mutex_lock(&fw->persist_lock);
+    devices = fw->persist_devices;
+    fw->persist_devices = g_ptr_array_new();
+    g_mutex_unlock(&fw->persist_lock);
+
+    for (i = 0; i < devices->len; i++) {
+        PCIDevice *d = g_ptr_array_index(devices, i);
+
+        if (cxl_type3_persist(d) != MEMTX_OK) {
+            result = MEMTX_ERROR;
+        }
+        object_unref(OBJECT(d));
+    }
+    g_ptr_array_free(devices, true);
+    return result;
+}
+
 const MemoryRegionOps cfmws_ops = {
     .read_with_attrs = cxl_read_cfmws,
     .write_with_attrs = cxl_write_cfmws,
+    .cache_block = cxl_cache_block_cfmws,
+    .persist = cxl_persist_cfmws,
     .endianness = DEVICE_LITTLE_ENDIAN,
     .valid = {
         .min_access_size = 1,
@@ -461,9 +522,24 @@ static void cxl_fmw_realize(DeviceState *dev, Error **errp)
 {
     CXLFixedWindow *fw = CXL_FMW(dev);
 
+    g_mutex_init(&fw->persist_lock);
+    fw->persist_devices = g_ptr_array_new();
     memory_region_init_io(&fw->mr, OBJECT(dev), &cfmws_ops, fw,
                           "cxl-fixed-memory-region", fw->size);
     sysbus_init_mmio(SYS_BUS_DEVICE(dev), &fw->mr);
+}
+
+static void cxl_fmw_unrealize(DeviceState *dev)
+{
+    CXLFixedWindow *fw = CXL_FMW(dev);
+    size_t i;
+
+    for (i = 0; i < fw->persist_devices->len; i++) {
+        object_unref(OBJECT(g_ptr_array_index(fw->persist_devices, i)));
+    }
+    g_ptr_array_free(fw->persist_devices, true);
+    fw->persist_devices = NULL;
+    g_mutex_clear(&fw->persist_lock);
 }
 
 /*
@@ -476,6 +552,7 @@ static void cxl_fmw_class_init(ObjectClass *klass, const void *data)
 
     dc->desc = "CXL Fixed Memory Window";
     dc->realize = cxl_fmw_realize;
+    dc->unrealize = cxl_fmw_unrealize;
     /* Reason - created by machines as tightly coupled to machine memory map */
     dc->user_creatable = false;
 }

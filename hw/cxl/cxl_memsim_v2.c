@@ -1166,6 +1166,25 @@ out:
     return success;
 }
 
+bool cxl_memsim_v2_cache_block(CxlMemsimV2Client *client,
+                               uint64_t address, int timeout_ms,
+                               Error **errp)
+{
+    uint64_t line_address;
+    bool success;
+
+    if (!client || timeout_ms <= 0) {
+        error_setg(errp, "invalid CXLMemSim v2 cache-block operation");
+        return false;
+    }
+    line_address = address & ~(uint64_t)(CXL_MEMSIM_V2_LINE_SIZE - 1);
+    qemu_mutex_lock(&client->operation_lock);
+    success = cxl_memsim_v2_cache_evict_address(
+        client, line_address, timeout_ms, errp);
+    qemu_mutex_unlock(&client->operation_lock);
+    return success;
+}
+
 static bool cxl_memsim_v2_atomic(CxlMemsimV2Client *client, CxlMemsimV2Opcode opcode, uint64_t address,
                                  uint64_t expected, uint64_t operand, uint64_t *old_value, uint64_t *new_value,
                                  int timeout_ms, Error **errp) {

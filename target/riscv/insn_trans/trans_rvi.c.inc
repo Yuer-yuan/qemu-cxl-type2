@@ -946,6 +946,7 @@ static bool trans_fence(DisasContext *ctx, arg_fence *a)
 {
     /* FENCE is a full memory barrier. */
     tcg_gen_mb(TCG_MO_ALL | TCG_BAR_SC);
+    gen_helper_memory_fence(tcg_env);
     return true;
 }
 

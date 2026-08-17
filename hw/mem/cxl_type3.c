@@ -407,9 +407,9 @@ static void build_dvsecs(CXLType3Dev *ct3d)
                                GPF_DEVICE_DVSEC_REVID, dvsec);
 
     dvsec = (uint8_t *)&(CXLDVSECPortFlexBus){
-        .cap                     = 0x26, /* 68B, IO, Mem, non-MLD */
+        .cap                     = 0x26, /* 68B/256B, IO, Mem, non-MLD */
         .ctrl                    = 0x02, /* IO always enabled */
-        .status                  = 0x26, /* same as capabilities */
+        .status                  = ct3d->flitmode ? 0x6 : 0x26,
         .rcvd_mod_ts_data_phase1 = 0xef, /* WTF? */
     };
     cxl_component_create_dvsec(cxl_cstate, CXL2_TYPE3_DEVICE,
@@ -890,6 +890,15 @@ static void ct3_realize(PCIDevice *pci_dev, Error **errp)
     uint16_t count;
 
     QTAILQ_INIT(&ct3d->error_list);
+
+    if (ct3d->hdmdb && !ct3d->flitmode) {
+        error_setg(errp, "hdm-db requires operating in 256B flit mode");
+        return;
+    }
+    if (ct3d->memsim_v2.config.enabled != ct3d->hdmdb) {
+        error_setg(errp, "coherence-v2 and hdm-db must be enabled together");
+        return;
+    }
 
     if (!cxl_setup_memory(ct3d, errp)) {
         return;
@@ -2449,6 +2458,9 @@ MemTxResult cxl_type3_read(PCIDevice *d, hwaddr host_addr, uint64_t *data,
     }
 
     if (ct3d->memsim_v2.enabled) {
+        if (!ct3d->bi_enabled) {
+            return MEMTX_ERROR;
+        }
         return cxl_type3_memsim_v2_read(&ct3d->memsim_v2, dpa_offset,
                                         data, size);
     }
@@ -2519,6 +2531,9 @@ MemTxResult cxl_type3_write(PCIDevice *d, hwaddr host_addr, uint64_t data,
     }
 
     if (ct3d->memsim_v2.enabled) {
+        if (!ct3d->bi_enabled) {
+            return MEMTX_ERROR;
+        }
         return cxl_type3_memsim_v2_write(&ct3d->memsim_v2, dpa_offset,
                                          data, size);
     }
@@ -2563,16 +2578,75 @@ MemTxResult cxl_type3_write(PCIDevice *d, hwaddr host_addr, uint64_t data,
     return address_space_write(as, dpa_offset, attrs, &data, size);
 }
 
+MemTxResult cxl_type3_cache_block(PCIDevice *d, hwaddr host_addr,
+                                  MemoryRegionCacheBlockOperation operation,
+                                  MemTxAttrs attrs)
+{
+    CXLType3Dev *ct3d = CXL_TYPE3(d);
+    uint64_t dpa_offset = 0;
+    AddressSpace *as = NULL;
+
+    if (cxl_type3_hpa_to_as_and_dpa(ct3d, host_addr, 1, &as,
+                                    &dpa_offset)) {
+        return MEMTX_ERROR;
+    }
+    if (cxl_dev_media_disabled(&ct3d->cxl_dstate)) {
+        return MEMTX_OK;
+    }
+    if (ct3d->memsim_v2.enabled) {
+        if (!ct3d->bi_enabled) {
+            return MEMTX_ERROR;
+        }
+        return cxl_type3_memsim_v2_cache_block(&ct3d->memsim_v2,
+                                               dpa_offset);
+    }
+    return address_space_cache_block(as, dpa_offset, attrs, operation);
+}
+
+MemTxResult cxl_type3_persist(PCIDevice *d)
+{
+    CXLType3Dev *ct3d = CXL_TYPE3(d);
+
+    if (!ct3d->memsim_v2.enabled) {
+        return MEMTX_OK;
+    }
+    if (!ct3d->bi_enabled) {
+        return MEMTX_ERROR;
+    }
+    return cxl_type3_memsim_v2_persist(&ct3d->memsim_v2);
+}
+
+static void cxl_type3_bi_control_write(CXLComponentState *cxl_cstate,
+                                       uint32_t old_ctrl, uint32_t new_ctrl,
+                                       void *opaque)
+{
+    CXLType3Dev *ct3d = opaque;
+    bool old_enabled = FIELD_EX32(old_ctrl, CXL_BI_DECODER_CTRL, BI_ENABLE);
+    bool new_enabled = FIELD_EX32(new_ctrl, CXL_BI_DECODER_CTRL, BI_ENABLE);
+
+    (void)cxl_cstate;
+    if (old_enabled == new_enabled) {
+        return;
+    }
+    ct3d->bi_enabled = new_enabled;
+    qemu_log_mask(LOG_TRACE, "CXL Type3: BI %s via decoder control\n",
+                  new_enabled ? "enabled" : "disabled");
+}
+
 static void ct3d_reset(DeviceState *dev)
 {
     CXLType3Dev *ct3d = CXL_TYPE3(dev);
+    CXLComponentState *cxl_cstate = &ct3d->cxl_cstate;
     uint32_t *reg_state = ct3d->cxl_cstate.crb.cache_mem_registers;
     uint32_t *write_msk = ct3d->cxl_cstate.crb.cache_mem_regs_write_mask;
 
     pcie_cap_fill_link_ep_usp(PCI_DEVICE(dev), ct3d->width, ct3d->speed,
-                              false);
+                              ct3d->flitmode);
     cxl_component_register_init_common(reg_state, write_msk,
-                                       CXL2_TYPE3_DEVICE, false);
+                                       CXL2_TYPE3_DEVICE, ct3d->hdmdb);
+    cxl_cstate->bi_control_write = cxl_type3_bi_control_write;
+    cxl_cstate->bi_control_opaque = ct3d;
+    ct3d->bi_enabled = false;
     cxl_device_register_init_t3(ct3d, CXL_T3_MSIX_MBOX);
 
     /*
@@ -2632,6 +2706,8 @@ static const Property ct3_props[] = {
                                 speed, PCIE_LINK_SPEED_32),
     DEFINE_PROP_PCIE_LINK_WIDTH("x-width", CXLType3Dev,
                                 width, PCIE_LINK_WIDTH_16),
+    DEFINE_PROP_BOOL("x-256b-flit", CXLType3Dev, flitmode, false),
+    DEFINE_PROP_BOOL("hdm-db", CXLType3Dev, hdmdb, false),
 };
 
 static uint64_t get_lsa_size(CXLType3Dev *ct3d)

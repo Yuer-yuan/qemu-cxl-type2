@@ -39,6 +39,8 @@ typedef struct CXLFixedWindow {
     /* Todo: XOR based interleaving */
     uint16_t restrictions;
     MemoryRegion mr;
+    GMutex persist_lock;
+    GPtrArray *persist_devices;
     hwaddr base;
 } CXLFixedWindow;
 #define TYPE_CXL_FMW "cxl-fmw"

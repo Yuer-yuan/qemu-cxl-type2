@@ -40,5 +40,8 @@ MemTxResult cxl_type3_memsim_v2_read(CxlType3MemsimV2 *state,
 MemTxResult cxl_type3_memsim_v2_write(CxlType3MemsimV2 *state,
                                       uint64_t dpa, uint64_t value,
                                       unsigned size);
+MemTxResult cxl_type3_memsim_v2_cache_block(CxlType3MemsimV2 *state,
+                                            uint64_t dpa);
+MemTxResult cxl_type3_memsim_v2_persist(CxlType3MemsimV2 *state);
 
 #endif /* CXL_TYPE3_MEMSIM_V2_H */

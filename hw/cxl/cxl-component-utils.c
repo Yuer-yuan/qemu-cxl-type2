@@ -211,6 +211,17 @@ void cxl_component_cache_mem_write(CXLComponentState *cxl_cstate,
         value &= mask;
         /* RO bits should remain constant. Done by reading existing value */
         value |= ~mask & cregs->cache_mem_registers[offset / 4];
+        /*
+         * BI control is common component-register behavior.  Type 3 devices
+         * install special write operations for HDM decoder and RAS handling,
+         * but those operations must not swallow the standard BI controls.
+         */
+        if (offset == A_CXL_BI_RT_CTRL ||
+            offset == A_CXL_BI_DECODER_CTRL) {
+            bi_handler(cxl_cstate, offset, value);
+            return;
+        }
+
         if (cregs->special_ops && cregs->special_ops->write) {
             cregs->special_ops->write(cxl_cstate, offset, value, size);
             return;
@@ -219,9 +230,6 @@ void cxl_component_cache_mem_write(CXLComponentState *cxl_cstate,
         if (offset >= A_CXL_HDM_DECODER_CAPABILITY &&
             offset <= A_CXL_HDM_DECODER3_TARGET_LIST_HI) {
             dumb_hdm_handler(cxl_cstate, offset, value);
-        } else if (offset == A_CXL_BI_RT_CTRL ||
-                   offset == A_CXL_BI_DECODER_CTRL) {
-            bi_handler(cxl_cstate, offset, value);
         } else {
             cregs->cache_mem_registers[offset / 4] = value;
         }

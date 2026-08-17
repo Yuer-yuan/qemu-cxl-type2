@@ -25,6 +25,28 @@
 #include "qemu/target-info.h"
 #include "qom/object.h"
 #include "trace.h"
+
+G_LOCK_DEFINE_STATIC(memory_persist_pending);
+static GPtrArray *memory_persist_regions;
+
+static void memory_region_schedule_persist(MemoryRegion *mr)
+{
+    size_t i;
+
+    G_LOCK(memory_persist_pending);
+    if (!memory_persist_regions) {
+        memory_persist_regions = g_ptr_array_new();
+    }
+    for (i = 0; i < memory_persist_regions->len; i++) {
+        if (g_ptr_array_index(memory_persist_regions, i) == mr) {
+            G_UNLOCK(memory_persist_pending);
+            return;
+        }
+    }
+    object_ref(OBJECT(mr));
+    g_ptr_array_add(memory_persist_regions, mr);
+    G_UNLOCK(memory_persist_pending);
+}
 #include "system/ram_addr.h"
 #include "system/kvm.h"
 #include "system/runstate.h"
@@ -1556,6 +1578,54 @@ MemTxResult memory_region_dispatch_write(MemoryRegion *mr,
                                       memory_region_write_with_attrs_accessor,
                                       mr, attrs);
     }
+}
+
+MemTxResult memory_region_dispatch_cache_block(
+    MemoryRegion *mr, hwaddr addr,
+    MemoryRegionCacheBlockOperation operation, MemTxAttrs attrs)
+{
+    MemTxResult result;
+
+    if (mr->alias) {
+        return memory_region_dispatch_cache_block(
+            mr->alias, mr->alias_offset + addr, operation, attrs);
+    }
+    if (!mr->ops || !mr->ops->cache_block) {
+        return MEMTX_OK;
+    }
+    result = mr->ops->cache_block(mr->opaque, addr, operation, attrs);
+    if (result == MEMTX_OK &&
+        operation != MEMORY_REGION_CACHE_BLOCK_INVALIDATE &&
+        mr->ops->persist) {
+        memory_region_schedule_persist(mr);
+    }
+    return result;
+}
+
+MemTxResult memory_region_persist_pending(void)
+{
+    GPtrArray *regions;
+    MemTxResult result = MEMTX_OK;
+    size_t i;
+
+    G_LOCK(memory_persist_pending);
+    regions = memory_persist_regions;
+    memory_persist_regions = NULL;
+    G_UNLOCK(memory_persist_pending);
+
+    if (!regions) {
+        return MEMTX_OK;
+    }
+    for (i = 0; i < regions->len; i++) {
+        MemoryRegion *mr = g_ptr_array_index(regions, i);
+
+        if (mr->ops && mr->ops->persist && mr->ops->persist(mr->opaque) != MEMTX_OK) {
+            result = MEMTX_ERROR;
+        }
+        object_unref(OBJECT(mr));
+    }
+    g_ptr_array_free(regions, true);
+    return result;
 }
 
 void memory_region_init_io(MemoryRegion *mr,

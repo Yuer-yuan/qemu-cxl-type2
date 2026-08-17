@@ -155,6 +155,8 @@ static void test_type3_coherence_v2_properties(void)
         "coherence-v2-timeout-ms",
         "coherence-v2-write-through",
         "coherence-v2-read-exclusive",
+        "x-256b-flit",
+        "hdm-db",
     };
     QTestState *qts = qtest_init("-machine none");
     size_t i;
@@ -162,6 +164,7 @@ static void test_type3_coherence_v2_properties(void)
     for (i = 0; i < G_N_ELEMENTS(expected); i++) {
         g_assert_true(device_has_property(qts, "cxl-type3", expected[i]));
     }
+    g_assert_true(device_has_property(qts, "cxl-rp", "x-256b-flit"));
     qtest_quit(qts);
 }
 
@@ -183,6 +186,7 @@ static void assert_cedt(const uint8_t *table, size_t length)
             g_assert_cmpuint(entry_length, >=, 36);
             if (ldq_le_p(entry + 8) == SIFIVE_U_CXL_FMW_BASE &&
                 ldq_le_p(entry + 16) == SIFIVE_U_CXL_FMW_SIZE) {
+                g_assert_cmphex(lduw_le_p(entry + 32), ==, 0x29);
                 found_cfmws = true;
             }
         }
@@ -224,12 +228,14 @@ static void assert_rhct(const uint8_t *table, size_t length)
 {
     const uint8_t *end = table + length;
     const uint8_t *node;
+    uint32_t isa_offset = 0;
+    uint32_t cmo_offset = 0;
     uint32_t node_count;
     unsigned int hart_nodes = 0;
 
     g_assert_cmpuint(length, >=, SIFIVE_U_RHCT_NODE_ARRAY_OFFSET);
     node_count = ldl_le_p(table + sizeof(TestAcpiHeader) + 12);
-    g_assert_cmpuint(node_count, ==, 5);
+    g_assert_cmpuint(node_count, ==, 6);
     node = table + ldl_le_p(table + sizeof(TestAcpiHeader) + 16);
 
     for (uint32_t i = 0; i < node_count; i++) {
@@ -241,14 +247,29 @@ static void assert_rhct(const uint8_t *table, size_t length)
         node_length = lduw_le_p(node + 2);
         g_assert_cmpuint(node_length, >=, 4);
         g_assert_true(node + node_length <= end);
-        if (type == 0xffff) {
-            g_assert_cmpuint(node_length, ==, 16);
+        if (type == 0) {
+            isa_offset = node - table;
+        } else if (type == 1) {
+            g_assert_cmpuint(node_length, ==, 10);
+            g_assert_cmpuint(lduw_le_p(node + 4), ==, 1);
+            g_assert_cmpuint(node[6], ==, 0);
+            g_assert_cmpuint(node[7], ==, 6);
+            g_assert_cmpuint(node[8], ==, 0);
+            g_assert_cmpuint(node[9], ==, 6);
+            cmo_offset = node - table;
+        } else if (type == 0xffff) {
+            g_assert_cmpuint(node_length, ==, 20);
+            g_assert_cmpuint(lduw_le_p(node + 6), ==, 2);
             g_assert_cmpuint(ldl_le_p(node + 8), ==, hart_nodes + 1);
+            g_assert_cmpuint(ldl_le_p(node + 12), ==, isa_offset);
+            g_assert_cmpuint(ldl_le_p(node + 16), ==, cmo_offset);
             hart_nodes++;
         }
         node += node_length;
     }
 
+    g_assert_cmpuint(isa_offset, !=, 0);
+    g_assert_cmpuint(cmo_offset, !=, 0);
     g_assert_cmpuint(hart_nodes, ==, 4);
 }
 
@@ -375,18 +396,20 @@ static void test_firmware_files(void)
     QTestState *qts;
 
     qts = qtest_init(
-        "-machine sifive_u,cxl=on -smp 5 "
+        "-machine sifive_u,cxl=on -cpu veyron-v1 -smp 5 "
         "-machine cxl-fmw.0.targets.0=cxl.1,cxl-fmw.0.size=4G,"
-        "cxl-fmw.0.restrictions=0xe "
+        "cxl-fmw.0.restrictions=0x29 "
         "-object memory-backend-ram,id=t3mem,size=256M,share=on "
         "-object memory-backend-ram,id=t3lsa,size=2M,share=on "
         "-device pxb-cxl,bus=pcie.0,bus_nr=64,id=cxl.1 "
-        "-device cxl-rp,bus=cxl.1,port=0,id=rp-t2,chassis=0,slot=0 "
+        "-device cxl-rp,bus=cxl.1,port=0,id=rp-t2,chassis=0,slot=0,"
+        "x-256b-flit=on "
         "-device cxl-type2,bus=rp-t2,gpu-mode=0,mem-size=256M,"
         "cache-size=64M,id=t2 "
-        "-device cxl-rp,bus=cxl.1,port=1,id=rp-t3,chassis=0,slot=1 "
+        "-device cxl-rp,bus=cxl.1,port=1,id=rp-t3,chassis=0,slot=1,"
+        "x-256b-flit=on "
         "-device cxl-type3,bus=rp-t3,volatile-memdev=t3mem,"
-        "lsa=t3lsa,id=t3");
+        "lsa=t3lsa,id=t3,x-256b-flit=on");
 
     tables = fw_cfg_file(qts, "etc/acpi/tables");
     loader = fw_cfg_file(qts, "etc/table-loader");

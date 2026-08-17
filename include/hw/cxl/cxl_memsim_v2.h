@@ -166,6 +166,9 @@ bool cxl_memsim_v2_load_exclusive(CxlMemsimV2Client *client,
 bool cxl_memsim_v2_store(CxlMemsimV2Client *client, uint64_t address,
                          unsigned size, uint64_t value, int timeout_ms,
                          Error **errp);
+bool cxl_memsim_v2_cache_block(CxlMemsimV2Client *client,
+                               uint64_t address, int timeout_ms,
+                               Error **errp);
 bool cxl_memsim_v2_fetch_add(CxlMemsimV2Client *client, uint64_t address,
                              uint64_t addend, uint64_t *old_value,
                              uint64_t *new_value, int timeout_ms,

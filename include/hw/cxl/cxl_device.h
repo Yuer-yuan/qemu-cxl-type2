@@ -608,6 +608,9 @@ struct CXLType3Dev {
     /* PCIe link characteristics */
     PCIExpLinkSpeed speed;
     PCIExpLinkWidth width;
+    bool flitmode;
+    bool hdmdb;
+    bool bi_enabled;
 
     /* DOE */
     DOECap doe_cdat;
@@ -708,6 +711,10 @@ MemTxResult cxl_type3_read(PCIDevice *d, hwaddr host_addr, uint64_t *data,
                            unsigned size, MemTxAttrs attrs);
 MemTxResult cxl_type3_write(PCIDevice *d, hwaddr host_addr, uint64_t data,
                             unsigned size, MemTxAttrs attrs);
+MemTxResult cxl_type3_cache_block(PCIDevice *d, hwaddr host_addr,
+                                  MemoryRegionCacheBlockOperation operation,
+                                  MemTxAttrs attrs);
+MemTxResult cxl_type3_persist(PCIDevice *d);
 
 uint64_t cxl_device_get_timestamp(CXLDeviceState *cxlds);
 
