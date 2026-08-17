@@ -1134,33 +1134,44 @@ static bool cxl_memsim_v2_upgrade_line(CxlMemsimV2Client *client, const CxlMemsi
     return true;
 }
 
-static bool cxl_memsim_v2_cache_ensure(CxlMemsimV2Client *client, uint64_t line_address, bool modified, int timeout_ms,
-                                       Error **errp) {
+/* Returns with state_lock and cache_lock held. */
+static CxlMemsimV2CacheLine *cxl_memsim_v2_cache_lock_for_access(
+    CxlMemsimV2Client *client, uint64_t line_address, bool modified,
+    int timeout_ms, Error **errp)
+{
     for (;;) {
         CxlMemsimV2CacheLine snapshot;
         CxlMemsimV2CacheLine *line;
         CxlMemsimV2Frame grant;
 
+        qemu_mutex_lock(&client->state_lock);
+        if (!client->connected) {
+            error_setg(errp, "%s", client->connection_error ?:
+                       "CXLMemSim v2 client is disconnected");
+            qemu_mutex_unlock(&client->state_lock);
+            return NULL;
+        }
         qemu_mutex_lock(&client->cache_lock);
         line = cxl_memsim_v2_cache_find_locked(client, line_address);
         if (line && (!modified || line->state == CXL_MEMSIM_V2_STATE_M)) {
             cxl_memsim_v2_cache_touch_locked(client, line);
-            qemu_mutex_unlock(&client->cache_lock);
-            return true;
+            return line;
         }
         if (line) {
             snapshot = *line;
             qemu_mutex_unlock(&client->cache_lock);
+            qemu_mutex_unlock(&client->state_lock);
             if (!cxl_memsim_v2_upgrade_line(client, &snapshot, &grant, timeout_ms, errp)) {
-                return false;
+                return NULL;
             }
             continue;
         }
         qemu_mutex_unlock(&client->cache_lock);
+        qemu_mutex_unlock(&client->state_lock);
 
         if (!cxl_memsim_v2_cache_make_room(client, line_address, timeout_ms, errp) ||
             !cxl_memsim_v2_acquire_line(client, line_address, modified, &grant, timeout_ms, errp)) {
-            return false;
+            return NULL;
         }
     }
 }
@@ -1189,26 +1200,13 @@ static bool cxl_memsim_v2_load_policy(CxlMemsimV2Client *client,
         unsigned line_offset = cursor & (CXL_MEMSIM_V2_LINE_SIZE - 1);
         unsigned chunk = MIN(size - copied, CXL_MEMSIM_V2_LINE_SIZE - line_offset);
 
-        if (!cxl_memsim_v2_cache_ensure(client, line_address, exclusive,
-                                        timeout_ms, errp)) {
-            goto out;
-        }
-        qemu_mutex_lock(&client->state_lock);
-        if (!client->connected) {
-            error_setg(errp, "%s", client->connection_error ?: "CXLMemSim v2 client is disconnected");
-            qemu_mutex_unlock(&client->state_lock);
-            goto out;
-        }
-        qemu_mutex_lock(&client->cache_lock);
-        line = cxl_memsim_v2_cache_find_locked(client, line_address);
+        line = cxl_memsim_v2_cache_lock_for_access(
+            client, line_address, exclusive, timeout_ms, errp);
         if (!line) {
-            qemu_mutex_unlock(&client->cache_lock);
-            qemu_mutex_unlock(&client->state_lock);
-            error_setg(errp, "CXLMemSim v2 load grant was invalidated");
             goto out;
         }
+        /* The cache lock makes grant validation and consumption atomic. */
         memcpy(bytes + copied, line->data + line_offset, chunk);
-        cxl_memsim_v2_cache_touch_locked(client, line);
         qemu_mutex_unlock(&client->cache_lock);
         qemu_mutex_unlock(&client->state_lock);
         cursor += chunk;
@@ -1258,26 +1256,13 @@ bool cxl_memsim_v2_store(CxlMemsimV2Client *client, uint64_t address, unsigned s
         unsigned line_offset = cursor & (CXL_MEMSIM_V2_LINE_SIZE - 1);
         unsigned chunk = MIN(size - copied, CXL_MEMSIM_V2_LINE_SIZE - line_offset);
 
-        if (!cxl_memsim_v2_cache_ensure(client, line_address, true, timeout_ms, errp)) {
-            goto out;
-        }
-        qemu_mutex_lock(&client->state_lock);
-        if (!client->connected) {
-            error_setg(errp, "%s", client->connection_error ?: "CXLMemSim v2 client is disconnected");
-            qemu_mutex_unlock(&client->state_lock);
-            goto out;
-        }
-        qemu_mutex_lock(&client->cache_lock);
-        line = cxl_memsim_v2_cache_find_locked(client, line_address);
-        if (!line || line->state != CXL_MEMSIM_V2_STATE_M) {
-            qemu_mutex_unlock(&client->cache_lock);
-            qemu_mutex_unlock(&client->state_lock);
-            error_setg(errp, "CXLMemSim v2 store grant was invalidated");
+        line = cxl_memsim_v2_cache_lock_for_access(
+            client, line_address, true, timeout_ms, errp);
+        if (!line) {
             goto out;
         }
         memcpy(line->data + line_offset, bytes + copied, chunk);
         line->dirty = true;
-        cxl_memsim_v2_cache_touch_locked(client, line);
         qemu_mutex_unlock(&client->cache_lock);
         qemu_mutex_unlock(&client->state_lock);
         if (client->write_policy == CXL_MEMSIM_V2_WRITE_THROUGH &&

@@ -24,6 +24,7 @@ typedef enum CachePeerScript {
     CACHE_PEER_FREE_FLUSH_FAILURE,
     CACHE_PEER_FREE_FENCE_FAILURE,
     CACHE_PEER_IMMEDIATE_SNOOP,
+    CACHE_PEER_IMMEDIATE_LOAD_SNOOP,
     CACHE_PEER_CLEAN_EVICTION_SNOOP_RACE,
     CACHE_PEER_UPGRADE_SNOOP_RACE,
     CACHE_PEER_EXCLUSIVE_LOAD,
@@ -44,6 +45,7 @@ typedef struct CachePeer {
     unsigned putm;
     unsigned fences;
     unsigned snoop_acks;
+    bool immediate_load_reacquired;
     uint64_t written_a;
     uint64_t written_b;
     uint16_t teardown_order[3];
@@ -519,6 +521,7 @@ static bool run_free_fence_failure_script(CachePeer *peer, uint8_t *frame) {
 static bool run_immediate_snoop_script(CachePeer *peer, uint8_t *frame) {
     uint8_t line[CXL_MEMSIM_V2_LINE_SIZE] = {0};
     uint8_t snoop[CXL_MEMSIM_V2_FRAME_SIZE];
+    uint64_t snooped_value;
 
     put_le64(line, 0, TEST_VALUE_A);
     if (!expect_frame(peer, CXL_MEMSIM_V2_OP_GETM, frame) ||
@@ -534,20 +537,89 @@ static bool run_immediate_snoop_script(CachePeer *peer, uint8_t *frame) {
     put_le64(snoop, 56, 2);
     if (!write_all(peer->fd, snoop, sizeof(snoop)) || !expect_frame(peer, CXL_MEMSIM_V2_OP_SNOOP_ACK, frame) ||
         get_le64(frame, 32) != 91 || get_le16(frame, 12) != CXL_MEMSIM_V2_STATUS_OK ||
-        frame[15] != CXL_MEMSIM_V2_STATE_I || get_le16(frame, 20) != CXL_MEMSIM_V2_LINE_SIZE ||
-        get_le64(frame, 104) != TEST_VALUE_A) {
+        frame[15] != CXL_MEMSIM_V2_STATE_I ||
+        get_le16(frame, 20) != CXL_MEMSIM_V2_LINE_SIZE) {
         peer->error_code = EPROTO;
         return false;
     }
     peer->immediate_snoop_acked = true;
+    snooped_value = get_le64(frame, 104);
+
+    if (snooped_value == TEST_VALUE_B) {
+        /* The store linearized before the snoop and needs no retry. */
+        set_phase(peer, 1);
+        return expect_clean_teardown(peer, frame);
+    }
+    if (snooped_value != TEST_VALUE_A) {
+        peer->error_code = EPROTO;
+        return false;
+    }
 
     memset(line, 0, sizeof(line));
     if (!expect_frame(peer, CXL_MEMSIM_V2_OP_GETM, frame) ||
-        !send_response(peer, frame, CXL_MEMSIM_V2_STATE_M, 3, line, 0) ||
-        !expect_putm(peer, frame, TEST_LINE_A, TEST_VALUE_B, 4)) {
+        !send_response(peer, frame, CXL_MEMSIM_V2_STATE_M, 3, line, 0)) {
         return false;
     }
-    return expect_clean_teardown(peer, frame);
+    set_phase(peer, 1);
+    return expect_putm(peer, frame, TEST_LINE_A, TEST_VALUE_B, 4) &&
+           expect_clean_teardown(peer, frame);
+}
+
+static bool run_immediate_load_snoop_script(CachePeer *peer, uint8_t *frame)
+{
+    uint8_t first_line[CXL_MEMSIM_V2_LINE_SIZE] = {0};
+    uint8_t second_line[CXL_MEMSIM_V2_LINE_SIZE] = {0};
+    uint8_t snoop[CXL_MEMSIM_V2_FRAME_SIZE];
+
+    put_le64(first_line, 0, TEST_VALUE_A);
+    put_le64(second_line, 0, TEST_VALUE_B);
+    if (!expect_frame(peer, CXL_MEMSIM_V2_OP_GETS, frame) ||
+        !send_response(peer, frame, CXL_MEMSIM_V2_STATE_E, 1,
+                       first_line, 0)) {
+        return false;
+    }
+    init_wire_frame(snoop, CXL_MEMSIM_V2_OP_SNP_INV);
+    put_le16(snoop, 16, CXL_MEMSIM_V2_SERVER_ENDPOINT);
+    put_le16(snoop, 18, CXL_MEMSIM_V2_DEVICE_ENDPOINT);
+    put_le64(snoop, 32, 94);
+    put_le64(snoop, 40, TEST_SESSION);
+    put_le64(snoop, 48, TEST_LINE_A);
+    put_le64(snoop, 56, 2);
+    if (!write_all(peer->fd, snoop, sizeof(snoop)) ||
+        !expect_frame(peer, CXL_MEMSIM_V2_OP_SNOOP_ACK, frame) ||
+        get_le64(frame, 32) != 94 ||
+        get_le16(frame, 12) != CXL_MEMSIM_V2_STATUS_OK ||
+        frame[15] != CXL_MEMSIM_V2_STATE_I) {
+        peer->error_code = EPROTO;
+        return false;
+    }
+    set_phase(peer, 1);
+    if (!read_all_timeout(peer->fd, frame, CXL_MEMSIM_V2_FRAME_SIZE) ||
+        get_le32(frame, 0) != CXL_MEMSIM_V2_MAGIC ||
+        get_le16(frame, 16) != CXL_MEMSIM_V2_DEVICE_ENDPOINT ||
+        get_le64(frame, 40) != TEST_SESSION) {
+        peer->error_code = EPROTO;
+        return false;
+    }
+    if (get_le16(frame, 6) == CXL_MEMSIM_V2_OP_GETS) {
+        if (get_le64(frame, 48) != TEST_LINE_A ||
+            !send_response(peer, frame, CXL_MEMSIM_V2_STATE_E, 3,
+                           second_line, 0)) {
+            peer->error_code = EPROTO;
+            return false;
+        }
+        peer->gets++;
+        peer->immediate_load_reacquired = true;
+        return expect_clean_teardown(peer, frame);
+    }
+    if (get_le16(frame, 6) == CXL_MEMSIM_V2_OP_FENCE) {
+        peer->fences++;
+        return send_response(peer, frame, CXL_MEMSIM_V2_STATE_I, 0,
+                             NULL, 0) &&
+               expect_unregister(peer, frame);
+    }
+    peer->error_code = EPROTO;
+    return false;
 }
 
 static bool run_clean_eviction_snoop_race_script(CachePeer *peer, uint8_t *frame) {
@@ -653,6 +725,9 @@ static gpointer cache_peer_thread(gpointer opaque) {
         break;
     case CACHE_PEER_IMMEDIATE_SNOOP:
         success = run_immediate_snoop_script(peer, frame);
+        break;
+    case CACHE_PEER_IMMEDIATE_LOAD_SNOOP:
+        success = run_immediate_load_snoop_script(peer, frame);
         break;
     case CACHE_PEER_CLEAN_EVICTION_SNOOP_RACE:
         success = run_clean_eviction_snoop_race_script(peer, frame);
@@ -964,9 +1039,37 @@ static void test_immediate_post_grant_snoop_observes_installed_line(void) {
 
     g_assert_true(cxl_memsim_v2_store(client, TEST_LINE_A, 8, TEST_VALUE_B, TEST_TIMEOUT_MS, &err));
     g_assert_null(err);
+    g_assert_true(wait_phase(&peer, 1));
     finish_cache_test(&peer, peer_thread, client);
     g_assert_true(peer.immediate_snoop_acked);
-    g_assert_cmpuint(peer.getm, ==, 2);
+    g_assert_true(peer.getm == 1 || peer.getm == 2);
+}
+
+static void test_load_reacquires_immediately_snooped_grant(void)
+{
+    CachePeer peer = {
+        .script = CACHE_PEER_IMMEDIATE_LOAD_SNOOP,
+    };
+    GThread *peer_thread;
+    CxlMemsimV2Client *client = start_cache_client(
+        &peer, CXL_MEMSIM_V2_LINE_SIZE, 1, &peer_thread);
+    Error *err = NULL;
+    uint64_t value = 0;
+
+    g_assert_true(cxl_memsim_v2_load(
+        client, TEST_LINE_A, 8, &value, TEST_TIMEOUT_MS, &err));
+    g_assert_null(err);
+    g_assert_true(wait_phase(&peer, 1));
+
+    finish_cache_test(&peer, peer_thread, client);
+    if (peer.immediate_load_reacquired) {
+        g_assert_cmphex(value, ==, TEST_VALUE_B);
+        g_assert_cmpuint(peer.gets, ==, 2);
+    } else {
+        g_assert_cmphex(value, ==, TEST_VALUE_A);
+        g_assert_cmpuint(peer.gets, ==, 1);
+    }
+    g_assert_cmpuint(peer.snoop_acks, ==, 1);
 }
 
 static void test_clean_eviction_racing_snoop_is_already_complete(void) {
@@ -1032,6 +1135,8 @@ int main(int argc, char **argv) {
     g_test_add_func("/cxl/type2/memsim-v2-cache/free-fence-failure", test_free_fence_failure_does_not_unregister);
     g_test_add_func("/cxl/type2/memsim-v2-cache/immediate-post-grant-snoop",
                     test_immediate_post_grant_snoop_observes_installed_line);
+    g_test_add_func("/cxl/type2/memsim-v2-cache/load-grant-snoop-retry",
+                    test_load_reacquires_immediately_snooped_grant);
     g_test_add_func("/cxl/type2/memsim-v2-cache/clean-eviction-snoop-race",
                     test_clean_eviction_racing_snoop_is_already_complete);
     g_test_add_func("/cxl/type2/memsim-v2-cache/upgrade-snoop-race",
