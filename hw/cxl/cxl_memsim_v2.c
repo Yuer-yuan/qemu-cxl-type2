@@ -10,6 +10,7 @@
 #include "io/channel-socket.h"
 #include "qapi/qapi-types-sockets.h"
 #include "qemu/bswap.h"
+#include "qemu/error-report.h"
 #include "qemu/thread.h"
 
 #define CXL_MEMSIM_V2_RESPONSE_ACK_INTERVAL 128
@@ -175,8 +176,38 @@ static bool cxl_memsim_v2_cache_snoop(CxlMemsimV2Client *client, const CxlMemsim
     }
 
     line = cxl_memsim_v2_cache_find_locked(client, snoop->addr);
-    if (!line || snoop->epoch <= line->epoch) {
+    if (!line) {
+        uint64_t marker_epoch = 0;
+        uint8_t marker_state = CXL_MEMSIM_V2_STATE_I;
+        size_t first = cxl_memsim_v2_cache_set(client, snoop->addr) * client->cache_ways;
+        size_t way;
+
+        for (way = 0; way < client->cache_ways; way++) {
+            const CxlMemsimV2CacheLine *candidate = &client->cache[first + way];
+
+            if (candidate->address == snoop->addr && candidate->epoch > marker_epoch) {
+                marker_epoch = candidate->epoch;
+                marker_state = candidate->state;
+            }
+        }
         qemu_mutex_unlock(&client->cache_lock);
+        error_report("CXLMemSim v2 snoop rejected opcode 0x%04x endpoint %u "
+                     "snoop %" PRIu64 " address 0x%" PRIx64 " epoch %" PRIu64
+                     ": no valid cache line (marker state %u epoch %" PRIu64 ")",
+                     snoop->type, client->endpoint, snoop->snoop_id, snoop->addr,
+                     snoop->epoch, marker_state, marker_epoch);
+        return true;
+    }
+    if (snoop->epoch <= line->epoch) {
+        uint8_t local_state = line->state;
+        uint64_t local_epoch = line->epoch;
+
+        qemu_mutex_unlock(&client->cache_lock);
+        error_report("CXLMemSim v2 snoop rejected opcode 0x%04x endpoint %u "
+                     "snoop %" PRIu64 " address 0x%" PRIx64 " epoch %" PRIu64
+                     ": local state %u epoch %" PRIu64 " is not older",
+                     snoop->type, client->endpoint, snoop->snoop_id, snoop->addr,
+                     snoop->epoch, local_state, local_epoch);
         return true;
     }
     switch (snoop->type) {
@@ -221,6 +252,18 @@ static bool cxl_memsim_v2_cache_snoop(CxlMemsimV2Client *client, const CxlMemsim
         break;
     default:
         break;
+    }
+    if (ack->status != CXL_MEMSIM_V2_STATUS_OK) {
+        uint8_t local_state = line->state;
+        uint64_t local_epoch = line->epoch;
+
+        qemu_mutex_unlock(&client->cache_lock);
+        error_report("CXLMemSim v2 snoop rejected opcode 0x%04x endpoint %u "
+                     "snoop %" PRIu64 " address 0x%" PRIx64 " epoch %" PRIu64
+                     ": incompatible local state %u epoch %" PRIu64,
+                     snoop->type, client->endpoint, snoop->snoop_id, snoop->addr,
+                     snoop->epoch, local_state, local_epoch);
+        return true;
     }
     qemu_mutex_unlock(&client->cache_lock);
     return true;
@@ -880,11 +923,30 @@ bool cxl_memsim_v2_client_transact(CxlMemsimV2Client *client, CxlMemsimV2Frame *
     return true;
 }
 
-static bool cxl_memsim_v2_response_ok(const CxlMemsimV2Frame *response, Error **errp) {
+static bool cxl_memsim_v2_response_ok(CxlMemsimV2Client *client,
+                                      const CxlMemsimV2Frame *request,
+                                      const CxlMemsimV2Frame *response,
+                                      Error **errp) {
+    uint64_t consumed_response_id;
+    uint64_t acknowledged_response_id;
+    bool response_ack_in_progress;
+
     if (response->status == CXL_MEMSIM_V2_STATUS_OK) {
         return true;
     }
-    error_setg(errp, "CXLMemSim v2 server status %u", response->status);
+    qemu_mutex_lock(&client->state_lock);
+    consumed_response_id = client->consumed_response_id;
+    acknowledged_response_id = client->acknowledged_response_id;
+    response_ack_in_progress = client->response_ack_in_progress;
+    qemu_mutex_unlock(&client->state_lock);
+    error_setg(errp,
+               "CXLMemSim v2 server status %u opcode 0x%04x endpoint %u "
+               "request %" PRIu64 " address 0x%" PRIx64 " size %u "
+               "response-ack consumed=%" PRIu64 " acknowledged=%" PRIu64 " in-progress=%u",
+               response->status, request->type, request->src_host,
+               request->request_id, request->addr, request->size,
+               consumed_response_id, acknowledged_response_id,
+               response_ack_in_progress);
     return false;
 }
 
@@ -896,7 +958,7 @@ static bool cxl_memsim_v2_acquire_line(CxlMemsimV2Client *client, uint64_t line_
     request.addr = line_address;
     request.state = CXL_MEMSIM_V2_STATE_I;
     if (!cxl_memsim_v2_client_transact(client, &request, response, timeout_ms, errp) ||
-        !cxl_memsim_v2_response_ok(response, errp)) {
+        !cxl_memsim_v2_response_ok(client, &request, response, errp)) {
         return false;
     }
     if (response->payload_len != CXL_MEMSIM_V2_LINE_SIZE ||
@@ -909,40 +971,95 @@ static bool cxl_memsim_v2_acquire_line(CxlMemsimV2Client *client, uint64_t line_
     return true;
 }
 
-static bool cxl_memsim_v2_release_line(CxlMemsimV2Client *client, uint64_t line_address, const CxlMemsimV2Frame *grant,
-                                       bool dirty, int timeout_ms, Error **errp) {
-    CxlMemsimV2Frame request;
-    CxlMemsimV2Frame response;
-
-    cxl_memsim_v2_frame_init(&request, dirty ? CXL_MEMSIM_V2_OP_PUTM : CXL_MEMSIM_V2_OP_PUTS);
-    request.addr = line_address;
-    request.state = grant->state;
-    request.epoch = grant->epoch;
+static bool cxl_memsim_v2_release_line(CxlMemsimV2Client *client, uint64_t line_address,
+                                       const CxlMemsimV2Frame *grant, bool dirty,
+                                       CxlMemsimV2Frame *request,
+                                       CxlMemsimV2Frame *response,
+                                       int timeout_ms, Error **errp) {
+    cxl_memsim_v2_frame_init(request, dirty ? CXL_MEMSIM_V2_OP_PUTM : CXL_MEMSIM_V2_OP_PUTS);
+    request->addr = line_address;
+    request->state = grant->state;
+    request->epoch = grant->epoch;
     if (dirty) {
-        request.payload_len = CXL_MEMSIM_V2_LINE_SIZE;
-        memcpy(request.data, grant->data, sizeof(request.data));
+        request->payload_len = CXL_MEMSIM_V2_LINE_SIZE;
+        memcpy(request->data, grant->data, sizeof(request->data));
     }
-    if (!cxl_memsim_v2_client_transact(client, &request, &response, timeout_ms, errp) ||
-        !cxl_memsim_v2_response_ok(&response, errp)) {
+    if (!cxl_memsim_v2_client_transact(client, request, response, timeout_ms, errp)) {
         return false;
     }
-    if (response.state != CXL_MEMSIM_V2_STATE_I || response.epoch <= grant->epoch || response.payload_len) {
+    if (response->status != CXL_MEMSIM_V2_STATUS_OK) {
+        return true;
+    }
+    if (response->state != CXL_MEMSIM_V2_STATE_I || response->epoch <= grant->epoch || response->payload_len) {
         error_setg(errp, "invalid CXLMemSim v2 line release");
         return false;
     }
     return true;
 }
 
+static bool cxl_memsim_v2_release_was_snooped_locked(CxlMemsimV2Client *client,
+                                                     const CxlMemsimV2CacheLine *snapshot) {
+    size_t first = cxl_memsim_v2_cache_set(client, snapshot->address) * client->cache_ways;
+    size_t way;
+
+    for (way = 0; way < client->cache_ways; way++) {
+        const CxlMemsimV2CacheLine *line = &client->cache[first + way];
+
+        if (!line->valid && line->address == snapshot->address &&
+            line->state == CXL_MEMSIM_V2_STATE_I && line->epoch > snapshot->epoch) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool cxl_memsim_v2_cache_snapshot_was_superseded_locked(
+    CxlMemsimV2Client *client, const CxlMemsimV2CacheLine *snapshot) {
+    size_t first = cxl_memsim_v2_cache_set(client, snapshot->address) * client->cache_ways;
+    size_t way;
+
+    for (way = 0; way < client->cache_ways; way++) {
+        const CxlMemsimV2CacheLine *line = &client->cache[first + way];
+
+        if (line->address == snapshot->address && line->epoch > snapshot->epoch) {
+            return true;
+        }
+    }
+    return false;
+}
+
 static bool cxl_memsim_v2_release_cached_line(CxlMemsimV2Client *client, const CxlMemsimV2CacheLine *line,
                                               int timeout_ms, Error **errp) {
     CxlMemsimV2Frame grant;
+    CxlMemsimV2Frame request;
+    CxlMemsimV2Frame response;
+    bool snooped;
 
     cxl_memsim_v2_frame_init(&grant, CXL_MEMSIM_V2_OP_RESPONSE);
     grant.state = line->state;
     grant.epoch = line->epoch;
     memcpy(grant.data, line->data, sizeof(grant.data));
-    return cxl_memsim_v2_release_line(client, line->address, &grant, line->state == CXL_MEMSIM_V2_STATE_M, timeout_ms,
-                                      errp);
+    if (!cxl_memsim_v2_release_line(client, line->address, &grant,
+                                    line->state == CXL_MEMSIM_V2_STATE_M,
+                                    &request, &response, timeout_ms, errp)) {
+        return false;
+    }
+    if (response.status == CXL_MEMSIM_V2_STATUS_OK) {
+        return true;
+    }
+
+    qemu_mutex_lock(&client->cache_lock);
+    snooped = cxl_memsim_v2_release_was_snooped_locked(client, line);
+    qemu_mutex_unlock(&client->cache_lock);
+    if (snooped && (response.status == CXL_MEMSIM_V2_STATUS_INVALID_STATE ||
+                    response.status == CXL_MEMSIM_V2_STATUS_STALE_EPOCH)) {
+        /*
+         * A competing request won the directory line and its snoop already
+         * completed this eviction.  The late PUTS/PUTM is therefore benign.
+         */
+        return true;
+    }
+    return cxl_memsim_v2_response_ok(client, &request, &response, errp);
 }
 
 static bool cxl_memsim_v2_cache_evict_address(CxlMemsimV2Client *client, uint64_t line_address, int timeout_ms,
@@ -990,14 +1107,25 @@ static bool cxl_memsim_v2_cache_make_room(CxlMemsimV2Client *client, uint64_t li
 static bool cxl_memsim_v2_upgrade_line(CxlMemsimV2Client *client, const CxlMemsimV2CacheLine *line,
                                        CxlMemsimV2Frame *response, int timeout_ms, Error **errp) {
     CxlMemsimV2Frame request;
+    bool superseded;
 
     cxl_memsim_v2_frame_init(&request, CXL_MEMSIM_V2_OP_UPGRADE);
     request.addr = line->address;
     request.state = line->state;
     request.epoch = line->epoch;
-    if (!cxl_memsim_v2_client_transact(client, &request, response, timeout_ms, errp) ||
-        !cxl_memsim_v2_response_ok(response, errp)) {
+    if (!cxl_memsim_v2_client_transact(client, &request, response, timeout_ms, errp)) {
         return false;
+    }
+    if (response->status != CXL_MEMSIM_V2_STATUS_OK) {
+        qemu_mutex_lock(&client->cache_lock);
+        superseded = cxl_memsim_v2_cache_snapshot_was_superseded_locked(client, line);
+        qemu_mutex_unlock(&client->cache_lock);
+        if (superseded &&
+            (response->status == CXL_MEMSIM_V2_STATUS_INVALID_STATE ||
+             response->status == CXL_MEMSIM_V2_STATUS_STALE_EPOCH)) {
+            return true;
+        }
+        return cxl_memsim_v2_response_ok(client, &request, response, errp);
     }
     if (response->state != CXL_MEMSIM_V2_STATE_M || response->epoch <= line->epoch || response->payload_len) {
         error_setg(errp, "invalid CXLMemSim v2 upgrade grant");
@@ -1213,7 +1341,7 @@ static bool cxl_memsim_v2_atomic(CxlMemsimV2Client *client, CxlMemsimV2Opcode op
     request.value = operand;
     request.size = sizeof(uint64_t);
     if (!cxl_memsim_v2_client_transact(client, &request, &response, timeout_ms, errp) ||
-        !cxl_memsim_v2_response_ok(&response, errp)) {
+        !cxl_memsim_v2_response_ok(client, &request, &response, errp)) {
         goto out;
     }
     if (response.state != CXL_MEMSIM_V2_STATE_M || response.payload_len != CXL_MEMSIM_V2_LINE_SIZE || !response.epoch) {
@@ -1289,7 +1417,7 @@ bool cxl_memsim_v2_fence(CxlMemsimV2Client *client, int timeout_ms, Error **errp
     }
     cxl_memsim_v2_frame_init(&request, CXL_MEMSIM_V2_OP_FENCE);
     success = cxl_memsim_v2_client_transact(client, &request, &response, timeout_ms, errp) &&
-              cxl_memsim_v2_response_ok(&response, errp) && response.state == CXL_MEMSIM_V2_STATE_I &&
+              cxl_memsim_v2_response_ok(client, &request, &response, errp) && response.state == CXL_MEMSIM_V2_STATE_I &&
               response.epoch == 0 && response.payload_len == 0;
     if (!success && errp && !*errp) {
         error_setg(errp, "invalid CXLMemSim v2 fence response");
