@@ -708,14 +708,6 @@ MemTxResult cxl_type3_read(PCIDevice *d, hwaddr host_addr, uint64_t *data,
                            unsigned size, MemTxAttrs attrs);
 MemTxResult cxl_type3_write(PCIDevice *d, hwaddr host_addr, uint64_t data,
                             unsigned size, MemTxAttrs attrs);
-MemTxResult cxl_type3_cache_block(PCIDevice *d, hwaddr host_addr,
-                                  MemoryRegionCacheBlockOperation operation,
-                                  MemTxAttrs attrs);
-bool cxl_type3_direct_access_enabled(PCIDevice *d);
-MemTxResult cxl_type3_direct_access_grant(
-    PCIDevice *d, hwaddr host_addr, bool write, IOMMUMemoryRegion *iommu,
-    hwaddr iova, AddressSpace **target_as, hwaddr *translated_addr,
-    IOMMUAccessFlags *perm, bool *mapped);
 
 uint64_t cxl_device_get_timestamp(CXLDeviceState *cxlds);
 

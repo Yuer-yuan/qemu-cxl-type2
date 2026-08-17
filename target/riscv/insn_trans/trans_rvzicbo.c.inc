@@ -33,7 +33,7 @@ static bool trans_cbo_clean(DisasContext *ctx, arg_cbo_clean *a)
     REQUIRE_ZICBOM(ctx);
     TCGv src = get_address(ctx, a->rs1, 0);
 
-    gen_helper_cbo_clean(tcg_env, src);
+    gen_helper_cbo_clean_flush(tcg_env, src);
     return true;
 }
 
@@ -42,7 +42,7 @@ static bool trans_cbo_flush(DisasContext *ctx, arg_cbo_flush *a)
     REQUIRE_ZICBOM(ctx);
     TCGv src = get_address(ctx, a->rs1, 0);
 
-    gen_helper_cbo_flush(tcg_env, src);
+    gen_helper_cbo_clean_flush(tcg_env, src);
     return true;
 }
 

@@ -22,8 +22,6 @@
 #include "hw/pci/pcie_port.h"
 #include "hw/pci-bridge/pci_expander_bridge.h"
 
-#define TYPE_CXL_FMW_IOMMU_MEMORY_REGION "cxl-fmw-iommu-memory-region"
-
 static void cxl_fixed_memory_window_config(CXLFixedMemoryWindowOptions *object,
                                            int index, Error **errp)
 {
@@ -289,32 +287,9 @@ static MemTxResult cxl_write_cfmws(void *opaque, hwaddr addr,
     return cxl_type3_write(d, addr + fw->base, data, size, attrs);
 }
 
-static MemTxResult cxl_cache_block_cfmws(
-    void *opaque, hwaddr addr, MemoryRegionCacheBlockOperation operation,
-    MemTxAttrs attrs)
-{
-    CXLFixedWindow *fw = opaque;
-    PCIDevice *d = cxl_cfmws_find_device(fw, addr);
-
-    if (!d) {
-        return MEMTX_ERROR;
-    }
-    return cxl_type3_cache_block(d, addr + fw->base, operation, attrs);
-}
-
-static MemTxResult cxl_map_tcg_cfmws(void *opaque, hwaddr addr,
-                                     IOMMUAccessFlags flag,
-                                     IOMMUMemoryRegion **notifier,
-                                     IOMMUTLBEntry *entry);
-static IOMMUMemoryRegion *cxl_map_tcg_notifier_cfmws(void *opaque,
-                                                     hwaddr addr);
-
 const MemoryRegionOps cfmws_ops = {
     .read_with_attrs = cxl_read_cfmws,
     .write_with_attrs = cxl_write_cfmws,
-    .cache_block = cxl_cache_block_cfmws,
-    .map_tcg_notifier = cxl_map_tcg_notifier_cfmws,
-    .map_tcg = cxl_map_tcg_cfmws,
     .endianness = DEVICE_LITTLE_ENDIAN,
     .valid = {
         .min_access_size = 1,
@@ -326,109 +301,6 @@ const MemoryRegionOps cfmws_ops = {
         .max_access_size = 8,
         .unaligned = true,
     },
-};
-
-static IOMMUMemoryRegion *cxl_map_tcg_notifier_cfmws(void *opaque,
-                                                     hwaddr addr)
-{
-    CXLFixedWindow *fw = opaque;
-    const hwaddr page_mask = CXL_MEMSIM_V2_RESIDENCY_PAGE_SIZE - 1;
-    hwaddr page = addr & ~page_mask;
-    PCIDevice *first;
-    PCIDevice *last;
-
-    if (page >= fw->size || fw->size - page < page_mask + 1) {
-        return NULL;
-    }
-    first = cxl_cfmws_find_device(fw, page);
-    last = cxl_cfmws_find_device(fw, page + page_mask);
-    if (!first || first != last || !cxl_type3_direct_access_enabled(first)) {
-        return NULL;
-    }
-    return &fw->iommu_mr;
-}
-
-static MemTxResult cxl_map_tcg_cfmws(void *opaque, hwaddr addr,
-                                     IOMMUAccessFlags flag,
-                                     IOMMUMemoryRegion **notifier,
-                                     IOMMUTLBEntry *entry)
-{
-    CXLFixedWindow *fw = opaque;
-    const hwaddr page_mask = CXL_MEMSIM_V2_RESIDENCY_PAGE_SIZE - 1;
-    hwaddr page = addr & ~page_mask;
-    PCIDevice *first;
-    PCIDevice *last;
-    AddressSpace *target_as = NULL;
-    hwaddr translated_addr = 0;
-    IOMMUAccessFlags perm = IOMMU_NONE;
-    bool mapped = false;
-    MemTxResult result;
-
-    if (!notifier || !entry) {
-        return MEMTX_ERROR;
-    }
-    *notifier = NULL;
-    *entry = (IOMMUTLBEntry) {
-        .iova = page,
-        .addr_mask = page_mask,
-        .perm = IOMMU_NONE,
-    };
-    if (page >= fw->size || fw->size - page < page_mask + 1) {
-        return MEMTX_ERROR;
-    }
-    first = cxl_cfmws_find_device(fw, page);
-    last = cxl_cfmws_find_device(fw, page + page_mask);
-    if (!first || first != last || !cxl_type3_direct_access_enabled(first)) {
-        return MEMTX_OK;
-    }
-    result = cxl_type3_direct_access_grant(
-        first, addr + fw->base, (flag & IOMMU_WO) != 0, &fw->iommu_mr,
-        page, &target_as, &translated_addr, &perm, &mapped);
-    if (result != MEMTX_OK || !mapped) {
-        return result;
-    }
-    entry->target_as = target_as;
-    entry->translated_addr = translated_addr;
-    entry->perm = perm;
-    *notifier = &fw->iommu_mr;
-    return MEMTX_OK;
-}
-
-static IOMMUTLBEntry cxl_fmw_notifier_translate(IOMMUMemoryRegion *iommu,
-                                                 hwaddr addr,
-                                                 IOMMUAccessFlags flag,
-                                                 int iommu_idx)
-{
-    const hwaddr page_mask = CXL_MEMSIM_V2_RESIDENCY_PAGE_SIZE - 1;
-
-    (void)iommu;
-    (void)flag;
-    (void)iommu_idx;
-    return (IOMMUTLBEntry) {
-        .iova = addr & ~page_mask,
-        .addr_mask = page_mask,
-        .perm = IOMMU_NONE,
-    };
-}
-
-static uint64_t cxl_fmw_iommu_min_page_size(IOMMUMemoryRegion *iommu)
-{
-    return CXL_MEMSIM_V2_RESIDENCY_PAGE_SIZE;
-}
-
-static void cxl_fmw_iommu_memory_region_class_init(ObjectClass *klass,
-                                                    const void *data)
-{
-    IOMMUMemoryRegionClass *imrc = IOMMU_MEMORY_REGION_CLASS(klass);
-
-    imrc->translate = cxl_fmw_notifier_translate;
-    imrc->get_min_page_size = cxl_fmw_iommu_min_page_size;
-}
-
-static const TypeInfo cxl_fmw_iommu_memory_region_info = {
-    .parent = TYPE_IOMMU_MEMORY_REGION,
-    .name = TYPE_CXL_FMW_IOMMU_MEMORY_REGION,
-    .class_init = cxl_fmw_iommu_memory_region_class_init,
 };
 
 static void machine_get_cxl(Object *obj, Visitor *v, const char *name,
@@ -591,9 +463,6 @@ static void cxl_fmw_realize(DeviceState *dev, Error **errp)
 
     memory_region_init_io(&fw->mr, OBJECT(dev), &cfmws_ops, fw,
                           "cxl-fixed-memory-region", fw->size);
-    memory_region_init_iommu(&fw->iommu_mr, sizeof(fw->iommu_mr),
-                             TYPE_CXL_FMW_IOMMU_MEMORY_REGION, OBJECT(dev),
-                             "cxl-fixed-memory-notifier", fw->size);
     sysbus_init_mmio(SYS_BUS_DEVICE(dev), &fw->mr);
 }
 
@@ -620,7 +489,6 @@ static const TypeInfo cxl_fmw_info = {
 
 static void cxl_host_register_types(void)
 {
-    type_register_static(&cxl_fmw_iommu_memory_region_info);
     type_register_static(&cxl_fmw_info);
 }
 type_init(cxl_host_register_types)

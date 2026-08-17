@@ -123,7 +123,7 @@ class SifiveU(LinuxKernelTest):
         self.vm.add_args(
             '-machine', 'cxl=on',
             '-machine',
-            'cxl-fmw.0.targets.0=cxl.1,cxl-fmw.0.size=128G',
+            'cxl-fmw.0.targets.0=cxl.1,cxl-fmw.0.size=8G',
             '-device', 'pxb-cxl,bus=pcie.0,bus_nr=64,id=cxl.1',
             '-display', 'none')
         self.vm.set_qmp_monitor(enabled=False)
@@ -131,7 +131,7 @@ class SifiveU(LinuxKernelTest):
         self.vm.wait(timeout=5)
         self.assertEqual(self.vm.exitcode(), 1)
         self.assertIn(
-            'sifive_u CXL: fixed windows exceed 64 GiB aperture',
+            'sifive_u CXL: fixed windows exceed 4 GiB aperture',
             self.vm.get_log())
 
     def test_sifive_u_cxl_off_rejects_pxb(self):

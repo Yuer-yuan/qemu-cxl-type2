@@ -23,7 +23,6 @@
 #include "exec/cpu-common.h"
 #include "exec/hwaddr.h"
 #include "exec/memattrs.h"
-#include "exec/mmu-access-type.h"
 #include "exec/vaddr.h"
 
 #if defined(CONFIG_TCG) && !defined(CONFIG_USER_ONLY)
@@ -94,19 +93,6 @@ void tlb_set_page_with_attrs(CPUState *cpu, vaddr addr,
 void tlb_set_page(CPUState *cpu, vaddr addr,
                   hwaddr paddr, int prot,
                   int mmu_idx, vaddr size);
-
-/**
- * tlb_set_page_for_access:
- *
- * Install a page while preserving the access type that caused the miss.
- * Directly mapped device memory uses this to request read permission for a
- * load and write permission only for a store.  Ordinary RAM behavior is
- * unchanged.
- */
-void tlb_set_page_for_access(CPUState *cpu, vaddr addr,
-                             hwaddr paddr, int prot,
-                             MMUAccessType access_type,
-                             int mmu_idx, vaddr size);
 
 #if defined(CONFIG_TCG) && !defined(CONFIG_USER_ONLY)
 /**

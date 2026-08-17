@@ -1022,9 +1022,8 @@ static inline void tlb_set_compare(CPUTLBEntryFull *full, CPUTLBEntry *ent,
  * Called from TCG-generated code, which is under an RCU read-side
  * critical section.
  */
-static void tlb_set_page_full_for_access(CPUState *cpu, int mmu_idx,
-                                         vaddr addr, CPUTLBEntryFull *full,
-                                         int access_type)
+void tlb_set_page_full(CPUState *cpu, int mmu_idx,
+                       vaddr addr, CPUTLBEntryFull *full)
 {
     CPUTLB *tlb = &cpu->neg.tlb;
     CPUTLBDesc *desc = &tlb->d[mmu_idx];
@@ -1051,8 +1050,7 @@ static void tlb_set_page_full_for_access(CPUState *cpu, int mmu_idx,
     prot = full->prot;
     asidx = cpu_asidx_from_attrs(cpu, full->attrs);
     section = address_space_translate_for_iotlb(cpu, asidx, paddr_page,
-                                                &xlat, &sz, full->attrs, &prot,
-                                                access_type);
+                                                &xlat, &sz, full->attrs, &prot);
     assert(sz >= TARGET_PAGE_SIZE);
 
     tlb_debug("vaddr=%016" VADDR_PRIx " paddr=0x" HWADDR_FMT_plx
@@ -1186,12 +1184,6 @@ static void tlb_set_page_full_for_access(CPUState *cpu, int mmu_idx,
     qemu_spin_unlock(&tlb->c.lock);
 }
 
-void tlb_set_page_full(CPUState *cpu, int mmu_idx,
-                       vaddr addr, CPUTLBEntryFull *full)
-{
-    tlb_set_page_full_for_access(cpu, mmu_idx, addr, full, -1);
-}
-
 void tlb_set_page_with_attrs(CPUState *cpu, vaddr addr,
                              hwaddr paddr, MemTxAttrs attrs, int prot,
                              int mmu_idx, vaddr size)
@@ -1213,22 +1205,6 @@ void tlb_set_page(CPUState *cpu, vaddr addr,
 {
     tlb_set_page_with_attrs(cpu, addr, paddr, MEMTXATTRS_UNSPECIFIED,
                             prot, mmu_idx, size);
-}
-
-void tlb_set_page_for_access(CPUState *cpu, vaddr addr,
-                             hwaddr paddr, int prot,
-                             MMUAccessType access_type,
-                             int mmu_idx, vaddr size)
-{
-    CPUTLBEntryFull full = {
-        .phys_addr = paddr,
-        .attrs = MEMTXATTRS_UNSPECIFIED,
-        .prot = prot,
-        .lg_page_size = ctz64(size)
-    };
-
-    assert(is_power_of_2(size));
-    tlb_set_page_full_for_access(cpu, mmu_idx, addr, &full, access_type);
 }
 
 /**

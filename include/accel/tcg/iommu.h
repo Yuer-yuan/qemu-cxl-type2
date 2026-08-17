@@ -32,10 +32,10 @@ MemoryRegionSection *address_space_translate_for_iotlb(CPUState *cpu,
                                                        hwaddr *xlat,
                                                        hwaddr *plen,
                                                        MemTxAttrs attrs,
-                                                       int *prot,
-                                                       int access_type);
+                                                       int *prot);
 
 hwaddr memory_region_section_get_iotlb(CPUState *cpu,
                                        MemoryRegionSection *section);
 
 #endif
+

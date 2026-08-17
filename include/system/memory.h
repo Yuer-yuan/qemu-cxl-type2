@@ -290,12 +290,6 @@ static inline void iommu_notifier_init(IOMMUNotifier *n, IOMMUNotify fn,
 /*
  * Memory region callbacks
  */
-typedef enum MemoryRegionCacheBlockOperation {
-    MEMORY_REGION_CACHE_BLOCK_CLEAN,
-    MEMORY_REGION_CACHE_BLOCK_FLUSH,
-    MEMORY_REGION_CACHE_BLOCK_INVALIDATE,
-} MemoryRegionCacheBlockOperation;
-
 struct MemoryRegionOps {
     /* Read from the memory region. @addr is relative to @mr; @size is
      * in bytes. */
@@ -319,27 +313,6 @@ struct MemoryRegionOps {
                                     uint64_t data,
                                     unsigned size,
                                     MemTxAttrs attrs);
-
-    /* Perform an architectural cache-block operation at @addr. Regions that
-     * do not model a private cache may leave this callback unset. */
-    MemTxResult (*cache_block)(void *opaque, hwaddr addr,
-                               MemoryRegionCacheBlockOperation operation,
-                               MemTxAttrs attrs);
-
-    /* Return the invalidation domain before map_tcg starts acquiring a direct
-     * grant.  TCG registers this notifier first so an invalidation concurrent
-     * with grant acquisition cannot be lost. */
-    IOMMUMemoryRegion *(*map_tcg_notifier)(void *opaque, hwaddr addr);
-
-    /* Optionally replace a TCG MMIO page with a directly accessible RAM page.
-     * Returning MEMTX_OK with @iotlb.target_as == NULL keeps the ordinary
-     * MMIO path.  @notifier must be supplied for every direct mapping so the
-     * provider can revoke cached CPU translations before changing access
-     * rights or reusing the backing page. */
-    MemTxResult (*map_tcg)(void *opaque, hwaddr addr,
-                           IOMMUAccessFlags flag,
-                           IOMMUMemoryRegion **notifier,
-                           IOMMUTLBEntry *iotlb);
 
     enum device_endian endianness;
     /* Guest-visible constraints: */
@@ -455,7 +428,6 @@ struct IOMMUMemoryRegionClass {
      */
     IOMMUTLBEntry (*translate)(IOMMUMemoryRegion *iommu, hwaddr addr,
                                IOMMUAccessFlags flag, int iommu_idx);
-
     /**
      * @get_min_page_size:
      *
@@ -2730,10 +2702,6 @@ MemTxResult memory_region_dispatch_write(MemoryRegion *mr,
                                          MemOp op,
                                          MemTxAttrs attrs);
 
-MemTxResult memory_region_dispatch_cache_block(
-    MemoryRegion *mr, hwaddr addr,
-    MemoryRegionCacheBlockOperation operation, MemTxAttrs attrs);
-
 /**
  * address_space_init: initializes an address space
  *
@@ -2799,15 +2767,6 @@ MemTxResult address_space_rw(AddressSpace *as, hwaddr addr,
 MemTxResult address_space_write(AddressSpace *as, hwaddr addr,
                                 MemTxAttrs attrs,
                                 const void *buf, hwaddr len);
-
-/**
- * address_space_cache_block: perform one architectural cache-block operation.
- *
- * RAM and devices without a cache model treat the operation as complete.
- */
-MemTxResult address_space_cache_block(
-    AddressSpace *as, hwaddr addr, MemTxAttrs attrs,
-    MemoryRegionCacheBlockOperation operation);
 
 /**
  * address_space_write_rom: write to address space, including ROM.

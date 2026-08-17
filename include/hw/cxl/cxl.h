@@ -39,8 +39,6 @@ typedef struct CXLFixedWindow {
     /* Todo: XOR based interleaving */
     uint16_t restrictions;
     MemoryRegion mr;
-    /* Hidden notifier domain for revoking TCG direct-RAM grants. */
-    IOMMUMemoryRegion iommu_mr;
     hwaddr base;
 } CXLFixedWindow;
 #define TYPE_CXL_FMW "cxl-fmw"

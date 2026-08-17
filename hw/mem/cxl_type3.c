@@ -26,11 +26,8 @@
 #include "qemu/range.h"
 #include "qemu/rcu.h"
 #include "qemu/guest-random.h"
-#include "qemu/main-loop.h"
 #include "system/hostmem.h"
-#include "system/cpus.h"
 #include "system/numa.h"
-#include "hw/core/cpu.h"
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
@@ -48,25 +45,6 @@ enum CXL_T3_MSIX_VECTOR {
 
 #define DWORD_BYTE 4
 #define CXL_CAPACITY_MULTIPLIER   (256 * MiB)
-
-static void cxl_type3_service_cpu_work(void *opaque)
-{
-    CPUState *cpu = current_cpu;
-    bool need_bql;
-
-    (void)opaque;
-    if (!cpu || cpu_work_list_empty(cpu)) {
-        return;
-    }
-    need_bql = !bql_locked();
-    if (need_bql) {
-        bql_lock();
-    }
-    process_queued_cpu_work(cpu);
-    if (need_bql) {
-        bql_unlock();
-    }
-}
 
 /* Default CDAT entries for a memory region */
 enum {
@@ -1009,12 +987,6 @@ static void ct3_realize(PCIDevice *pci_dev, Error **errp)
         }
     }
     if (!cxl_type3_memsim_v2_realize(&ct3d->memsim_v2, errp)) {
-        goto err_aer_exit;
-    }
-    if (ct3d->memsim_v2.enabled &&
-        !cxl_type3_memsim_v2_set_wait_service(
-            &ct3d->memsim_v2, cxl_type3_service_cpu_work, ct3d, errp)) {
-        cxl_type3_memsim_v2_unrealize(&ct3d->memsim_v2);
         goto err_aer_exit;
     }
 
@@ -2477,7 +2449,7 @@ MemTxResult cxl_type3_read(PCIDevice *d, hwaddr host_addr, uint64_t *data,
     }
 
     if (ct3d->memsim_v2.enabled) {
-        return cxl_type3_memsim_v2_read(&ct3d->memsim_v2, as, dpa_offset,
+        return cxl_type3_memsim_v2_read(&ct3d->memsim_v2, dpa_offset,
                                         data, size);
     }
 
@@ -2547,7 +2519,7 @@ MemTxResult cxl_type3_write(PCIDevice *d, hwaddr host_addr, uint64_t data,
     }
 
     if (ct3d->memsim_v2.enabled) {
-        return cxl_type3_memsim_v2_write(&ct3d->memsim_v2, as, dpa_offset,
+        return cxl_type3_memsim_v2_write(&ct3d->memsim_v2, dpa_offset,
                                          data, size);
     }
 
@@ -2589,89 +2561,6 @@ MemTxResult cxl_type3_write(PCIDevice *d, hwaddr host_addr, uint64_t data,
 
     /* Perform local write (SHM mode or fallback) */
     return address_space_write(as, dpa_offset, attrs, &data, size);
-}
-
-MemTxResult cxl_type3_cache_block(PCIDevice *d, hwaddr host_addr,
-                                  MemoryRegionCacheBlockOperation operation,
-                                  MemTxAttrs attrs)
-{
-    CXLType3Dev *ct3d = CXL_TYPE3(d);
-    uint64_t dpa_offset = 0;
-    AddressSpace *as = NULL;
-
-    if (cxl_type3_hpa_to_as_and_dpa(ct3d, host_addr, 1, &as,
-                                    &dpa_offset)) {
-        return MEMTX_ERROR;
-    }
-    if (cxl_dev_media_disabled(&ct3d->cxl_dstate)) {
-        return MEMTX_OK;
-    }
-    if (ct3d->memsim_v2.enabled) {
-        return cxl_type3_memsim_v2_cache_block(
-            &ct3d->memsim_v2, dpa_offset,
-            operation == MEMORY_REGION_CACHE_BLOCK_FLUSH);
-    }
-    return address_space_cache_block(as, dpa_offset, attrs, operation);
-}
-
-bool cxl_type3_direct_access_enabled(PCIDevice *d)
-{
-    CXLType3Dev *ct3d;
-
-    if (!d || !object_dynamic_cast(OBJECT(d), TYPE_CXL_TYPE3)) {
-        return false;
-    }
-    ct3d = CXL_TYPE3(d);
-    return !cxl_dev_media_disabled(&ct3d->cxl_dstate) &&
-           cxl_type3_memsim_v2_direct_enabled(&ct3d->memsim_v2);
-}
-
-MemTxResult cxl_type3_direct_access_grant(
-    PCIDevice *d, hwaddr host_addr, bool write, IOMMUMemoryRegion *iommu,
-    hwaddr iova, AddressSpace **target_as, hwaddr *translated_addr,
-    IOMMUAccessFlags *perm, bool *mapped)
-{
-    CXLType3Dev *ct3d;
-    AddressSpace *first_as = NULL;
-    AddressSpace *last_as = NULL;
-    uint64_t first_dpa = 0;
-    uint64_t last_dpa = 0;
-    Error *local_err = NULL;
-
-    if (!target_as || !translated_addr || !perm || !mapped) {
-        return MEMTX_ERROR;
-    }
-    *mapped = false;
-    if (!cxl_type3_direct_access_enabled(d)) {
-        return MEMTX_OK;
-    }
-    ct3d = CXL_TYPE3(d);
-    host_addr &= ~(hwaddr)(CXL_MEMSIM_V2_RESIDENCY_PAGE_SIZE - 1);
-    if (cxl_type3_hpa_to_as_and_dpa(
-            ct3d, host_addr, CXL_MEMSIM_V2_RESIDENCY_PAGE_SIZE, &first_as,
-            &first_dpa) ||
-        cxl_type3_hpa_to_as_and_dpa(
-            ct3d, host_addr + CXL_MEMSIM_V2_RESIDENCY_PAGE_SIZE - 1, 1,
-            &last_as, &last_dpa)) {
-        return MEMTX_ERROR;
-    }
-    /* A direct TCG entry must describe one contiguous 4 KiB backing page. */
-    if (first_as != last_as ||
-        last_dpa != first_dpa + CXL_MEMSIM_V2_RESIDENCY_PAGE_SIZE - 1) {
-        return MEMTX_OK;
-    }
-    if (!cxl_type3_memsim_v2_direct_grant(
-            &ct3d->memsim_v2, first_as, first_dpa, write, iommu, iova, perm,
-            &local_err)) {
-        if (local_err) {
-            error_report_err(local_err);
-        }
-        return MEMTX_ERROR;
-    }
-    *target_as = first_as;
-    *translated_addr = first_dpa;
-    *mapped = true;
-    return MEMTX_OK;
 }
 
 static void ct3d_reset(DeviceState *dev)

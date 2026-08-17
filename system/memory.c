@@ -1558,20 +1558,6 @@ MemTxResult memory_region_dispatch_write(MemoryRegion *mr,
     }
 }
 
-MemTxResult memory_region_dispatch_cache_block(
-    MemoryRegion *mr, hwaddr addr,
-    MemoryRegionCacheBlockOperation operation, MemTxAttrs attrs)
-{
-    if (mr->alias) {
-        return memory_region_dispatch_cache_block(
-            mr->alias, mr->alias_offset + addr, operation, attrs);
-    }
-    if (!mr->ops || !mr->ops->cache_block) {
-        return MEMTX_OK;
-    }
-    return mr->ops->cache_block(mr->opaque, addr, operation, attrs);
-}
-
 void memory_region_init_io(MemoryRegion *mr,
                            Object *owner,
                            const MemoryRegionOps *ops,
