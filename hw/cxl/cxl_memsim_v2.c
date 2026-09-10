@@ -11,6 +11,7 @@
 #include "qapi/qapi-types-sockets.h"
 #include "qemu/bswap.h"
 #include "qemu/error-report.h"
+#include "qemu/queue.h"
 #include "qemu/thread.h"
 
 #define CXL_MEMSIM_V2_RESPONSE_ACK_INTERVAL 128
@@ -26,6 +27,7 @@ typedef struct CxlMemsimV2Pending {
 } CxlMemsimV2Pending;
 
 typedef struct CxlMemsimV2CacheLine {
+    QTAILQ_ENTRY(CxlMemsimV2CacheLine) modified_link;
     uint64_t address;
     uint64_t epoch;
     uint64_t last_used;
@@ -50,6 +52,7 @@ struct CxlMemsimV2Client {
     GHashTable *pending;
     GHashTable *completed_retries;
     CxlMemsimV2CacheLine *cache;
+    QTAILQ_HEAD(, CxlMemsimV2CacheLine) modified;
     CxlMemsimV2SnoopHandler snoop_handler;
     void *snoop_opaque;
     char *connection_error;
@@ -58,6 +61,7 @@ struct CxlMemsimV2Client {
     uint16_t cache_ways;
     int timeout_ms;
     uint64_t cache_clock;
+    uint64_t fence_cache_visits;
     CxlMemsimV2WritePolicy write_policy;
     unsigned progress_starts;
     bool started;
@@ -70,6 +74,34 @@ struct CxlMemsimV2Client {
 QEMU_BUILD_BUG_ON(sizeof(CxlMemsimV2Frame) != CXL_MEMSIM_V2_FRAME_SIZE);
 QEMU_BUILD_BUG_ON(offsetof(CxlMemsimV2Frame, request_id) != 24);
 QEMU_BUILD_BUG_ON(offsetof(CxlMemsimV2Frame, data) != 104);
+
+/*
+ * Exact index of valid M holders, including clean exclusive-load grants.
+ * All state transitions and index updates share cache_lock. Never index a
+ * by-value release snapshot: only stable slots in client->cache are linked.
+ */
+static void cxl_memsim_v2_cache_state_locked(CxlMemsimV2Client *client,
+                                           CxlMemsimV2CacheLine *line,
+                                           uint8_t state)
+{
+    bool was_modified = line->valid && line->state == CXL_MEMSIM_V2_STATE_M;
+    bool modified = state == CXL_MEMSIM_V2_STATE_M;
+
+    assert(!modified || line->valid);
+    if (was_modified && !modified) {
+        QTAILQ_REMOVE(&client->modified, line, modified_link);
+    } else if (!was_modified && modified) {
+        QTAILQ_INSERT_TAIL(&client->modified, line, modified_link);
+    }
+    line->state = state;
+}
+
+static void cxl_memsim_v2_cache_clear_locked(CxlMemsimV2Client *client,
+                                           CxlMemsimV2CacheLine *line)
+{
+    cxl_memsim_v2_cache_state_locked(client, line, CXL_MEMSIM_V2_STATE_I);
+    memset(line, 0, sizeof(*line));
+}
 
 static bool cxl_memsim_v2_is_snoop(uint16_t opcode) {
     return opcode == CXL_MEMSIM_V2_OP_SNP_INV || opcode == CXL_MEMSIM_V2_OP_SNP_DOWNGRADE ||
@@ -158,15 +190,12 @@ static void cxl_memsim_v2_cache_touch_locked(CxlMemsimV2Client *client, CxlMemsi
 
 static bool cxl_memsim_v2_cache_snoop(CxlMemsimV2Client *client, const CxlMemsimV2Frame *snoop, CxlMemsimV2Frame *ack) {
     CxlMemsimV2CacheLine *line;
-    size_t index;
 
     qemu_mutex_lock(&client->cache_lock);
     if (snoop->type == CXL_MEMSIM_V2_OP_HOST_FENCE) {
-        for (index = 0; index < client->cache_line_count; index++) {
-            if (client->cache[index].valid && client->cache[index].state == CXL_MEMSIM_V2_STATE_M) {
-                qemu_mutex_unlock(&client->cache_lock);
-                return true;
-            }
+        if (!QTAILQ_EMPTY(&client->modified)) {
+            qemu_mutex_unlock(&client->cache_lock);
+            return true;
         }
         memset(client->cache, 0, client->cache_line_count * sizeof(*client->cache));
         ack->status = CXL_MEMSIM_V2_STATUS_OK;
@@ -215,9 +244,9 @@ static bool cxl_memsim_v2_cache_snoop(CxlMemsimV2Client *client, const CxlMemsim
         if (line->state != CXL_MEMSIM_V2_STATE_S && line->state != CXL_MEMSIM_V2_STATE_E) {
             break;
         }
+        cxl_memsim_v2_cache_state_locked(client, line, CXL_MEMSIM_V2_STATE_I);
         line->valid = false;
         line->dirty = false;
-        line->state = CXL_MEMSIM_V2_STATE_I;
         line->epoch = snoop->epoch;
         ack->status = CXL_MEMSIM_V2_STATUS_OK;
         ack->state = CXL_MEMSIM_V2_STATE_I;
@@ -226,7 +255,7 @@ static bool cxl_memsim_v2_cache_snoop(CxlMemsimV2Client *client, const CxlMemsim
         if (line->state != CXL_MEMSIM_V2_STATE_E) {
             break;
         }
-        line->state = CXL_MEMSIM_V2_STATE_S;
+        cxl_memsim_v2_cache_state_locked(client, line, CXL_MEMSIM_V2_STATE_S);
         line->epoch = snoop->epoch;
         ack->status = CXL_MEMSIM_V2_STATUS_OK;
         ack->state = CXL_MEMSIM_V2_STATE_S;
@@ -241,11 +270,11 @@ static bool cxl_memsim_v2_cache_snoop(CxlMemsimV2Client *client, const CxlMemsim
         line->dirty = false;
         line->epoch = snoop->epoch;
         if (snoop->type == CXL_MEMSIM_V2_OP_SNP_DATA_INV) {
+            cxl_memsim_v2_cache_state_locked(client, line, CXL_MEMSIM_V2_STATE_I);
             line->valid = false;
-            line->state = CXL_MEMSIM_V2_STATE_I;
             ack->state = CXL_MEMSIM_V2_STATE_I;
         } else {
-            line->state = CXL_MEMSIM_V2_STATE_S;
+            cxl_memsim_v2_cache_state_locked(client, line, CXL_MEMSIM_V2_STATE_S);
             ack->state = CXL_MEMSIM_V2_STATE_S;
         }
         ack->status = CXL_MEMSIM_V2_STATUS_OK;
@@ -477,7 +506,7 @@ static bool cxl_memsim_v2_install_grant(CxlMemsimV2Client *client, const CxlMems
             qemu_mutex_unlock(&client->cache_lock);
             return false;
         }
-        line->state = CXL_MEMSIM_V2_STATE_M;
+        cxl_memsim_v2_cache_state_locked(client, line, CXL_MEMSIM_V2_STATE_M);
         line->epoch = response->epoch;
         cxl_memsim_v2_cache_touch_locked(client, line);
         qemu_mutex_unlock(&client->cache_lock);
@@ -498,11 +527,11 @@ static bool cxl_memsim_v2_install_grant(CxlMemsimV2Client *client, const CxlMems
         qemu_mutex_unlock(&client->cache_lock);
         return false;
     }
-    memset(line, 0, sizeof(*line));
+    cxl_memsim_v2_cache_clear_locked(client, line);
     line->address = line_address;
     line->epoch = response->epoch;
-    line->state = response->state;
     line->valid = true;
+    cxl_memsim_v2_cache_state_locked(client, line, response->state);
     memcpy(line->data, response->data, sizeof(line->data));
     cxl_memsim_v2_cache_touch_locked(client, line);
     qemu_mutex_unlock(&client->cache_lock);
@@ -599,6 +628,7 @@ CxlMemsimV2Client *cxl_memsim_v2_client_new(uint16_t endpoint, CxlMemsimV2SnoopH
     }
     client = g_new0(CxlMemsimV2Client, 1);
     client->endpoint = endpoint;
+    QTAILQ_INIT(&client->modified);
     client->next_request_id = 1;
     client->write_policy = CXL_MEMSIM_V2_WRITE_BACK;
     client->snoop_handler = snoop_handler;
@@ -1030,36 +1060,75 @@ static bool cxl_memsim_v2_cache_snapshot_was_superseded_locked(
 
 static bool cxl_memsim_v2_release_cached_line(CxlMemsimV2Client *client, const CxlMemsimV2CacheLine *line,
                                               int timeout_ms, Error **errp) {
+    CxlMemsimV2CacheLine snapshot = *line;
     CxlMemsimV2Frame grant;
     CxlMemsimV2Frame request;
     CxlMemsimV2Frame response;
-    bool snooped;
 
-    cxl_memsim_v2_frame_init(&grant, CXL_MEMSIM_V2_OP_RESPONSE);
-    grant.state = line->state;
-    grant.epoch = line->epoch;
-    memcpy(grant.data, line->data, sizeof(grant.data));
-    if (!cxl_memsim_v2_release_line(client, line->address, &grant,
-                                    line->state == CXL_MEMSIM_V2_STATE_M,
-                                    &request, &response, timeout_ms, errp)) {
-        return false;
-    }
-    if (response.status == CXL_MEMSIM_V2_STATUS_OK) {
-        return true;
-    }
+    /*
+     * operation_lock excludes local stores, reacquisition and replacement;
+     * only the progress thread's snoops can supersede this snapshot. Those
+     * transitions are M/E -> S -> I, so there is at most one PUTS retry.
+     * Do not treat an unproved rejection or transport/I/O error as success.
+     */
+    for (;;) {
+        CxlMemsimV2CacheLine *current;
+        bool invalidated;
+        bool downgraded;
 
-    qemu_mutex_lock(&client->cache_lock);
-    snooped = cxl_memsim_v2_release_was_snooped_locked(client, line);
-    qemu_mutex_unlock(&client->cache_lock);
-    if (snooped && (response.status == CXL_MEMSIM_V2_STATUS_INVALID_STATE ||
-                    response.status == CXL_MEMSIM_V2_STATUS_STALE_EPOCH)) {
+        cxl_memsim_v2_frame_init(&grant, CXL_MEMSIM_V2_OP_RESPONSE);
+        grant.state = snapshot.state;
+        grant.epoch = snapshot.epoch;
+        memcpy(grant.data, snapshot.data, sizeof(grant.data));
+        if (!cxl_memsim_v2_release_line(client, snapshot.address, &grant,
+                                       snapshot.state == CXL_MEMSIM_V2_STATE_M,
+                                       &request, &response, timeout_ms, errp)) {
+            return false;
+        }
+        if (response.status == CXL_MEMSIM_V2_STATUS_OK) {
+            bool matches;
+
+            qemu_mutex_lock(&client->cache_lock);
+            current = cxl_memsim_v2_cache_find_locked(client, snapshot.address);
+            matches = !current || (current->epoch == snapshot.epoch &&
+                                   current->state == snapshot.state);
+            if (current && matches) {
+                cxl_memsim_v2_cache_clear_locked(client, current);
+            }
+            qemu_mutex_unlock(&client->cache_lock);
+            if (!matches) {
+                error_setg(errp, "CXLMemSim v2 release superseded by an unexpected holder");
+            }
+            return matches;
+        }
+        if (response.status != CXL_MEMSIM_V2_STATUS_INVALID_STATE &&
+            response.status != CXL_MEMSIM_V2_STATUS_STALE_EPOCH) {
+            return cxl_memsim_v2_response_ok(client, &request, &response, errp);
+        }
+
+        qemu_mutex_lock(&client->cache_lock);
+        invalidated = cxl_memsim_v2_release_was_snooped_locked(client, &snapshot);
+        current = cxl_memsim_v2_cache_find_locked(client, snapshot.address);
+        downgraded = current && current->state == CXL_MEMSIM_V2_STATE_S &&
+                     !current->dirty && current->epoch > snapshot.epoch &&
+                     (snapshot.state == CXL_MEMSIM_V2_STATE_M ||
+                      snapshot.state == CXL_MEMSIM_V2_STATE_E);
+        if (downgraded) {
+            snapshot = *current;
+        }
+        qemu_mutex_unlock(&client->cache_lock);
+        if (invalidated) {
+            return true;
+        }
+        if (!downgraded) {
+            return cxl_memsim_v2_response_ok(client, &request, &response, errp);
+        }
         /*
-         * A competing request won the directory line and its snoop already
-         * completed this eviction.  The late PUTS/PUTM is therefore benign.
+         * The dirty snoop already returned the newest bytes, but the
+         * directory still tracks our clean S holder. Release it with its
+         * current epoch instead of discarding it or retrying the old PUTM.
          */
-        return true;
     }
-    return cxl_memsim_v2_response_ok(client, &request, &response, errp);
 }
 
 static bool cxl_memsim_v2_cache_evict_address(CxlMemsimV2Client *client, uint64_t line_address, int timeout_ms,
@@ -1076,16 +1145,7 @@ static bool cxl_memsim_v2_cache_evict_address(CxlMemsimV2Client *client, uint64_
     snapshot = *line;
     qemu_mutex_unlock(&client->cache_lock);
 
-    if (!cxl_memsim_v2_release_cached_line(client, &snapshot, timeout_ms, errp)) {
-        return false;
-    }
-    qemu_mutex_lock(&client->cache_lock);
-    line = cxl_memsim_v2_cache_find_locked(client, line_address);
-    if (line) {
-        memset(line, 0, sizeof(*line));
-    }
-    qemu_mutex_unlock(&client->cache_lock);
-    return true;
+    return cxl_memsim_v2_release_cached_line(client, &snapshot, timeout_ms, errp);
 }
 
 static bool cxl_memsim_v2_cache_make_room(CxlMemsimV2Client *client, uint64_t line_address, int timeout_ms,
@@ -1344,7 +1404,7 @@ static bool cxl_memsim_v2_atomic(CxlMemsimV2Client *client, CxlMemsimV2Opcode op
         qemu_mutex_lock(&client->cache_lock);
         line = cxl_memsim_v2_cache_find_locked(client, line_address);
         if (line) {
-            memset(line, 0, sizeof(*line));
+            cxl_memsim_v2_cache_clear_locked(client, line);
         }
         qemu_mutex_unlock(&client->cache_lock);
         error_free(release_err);
@@ -1372,40 +1432,60 @@ bool cxl_memsim_v2_fence(CxlMemsimV2Client *client, int timeout_ms, Error **errp
     CxlMemsimV2Frame request;
     CxlMemsimV2Frame response;
     bool success;
+    int64_t started = g_get_monotonic_time();
+    int64_t acquired;
+    int64_t released = 0;
+    uint64_t visits = 0;
 
     if (!client) {
         error_setg(errp, "invalid CXLMemSim v2 fence client");
         return false;
     }
     qemu_mutex_lock(&client->operation_lock);
+    acquired = g_get_monotonic_time();
+    /*
+     * Local additions/replacements are excluded by operation_lock. Snoops
+     * can remove M holders, never add them. Each iteration therefore visits
+     * at most one of the M holders present at lock acquisition: O(M), with
+     * O(1) empty-fence work, independent of configured cache capacity.
+     */
     for (;;) {
-        uint64_t dirty_address = 0;
-        bool found = false;
-        size_t index;
+        uint64_t dirty_address;
+        CxlMemsimV2CacheLine *line;
 
         qemu_mutex_lock(&client->cache_lock);
-        for (index = 0; index < client->cache_line_count; index++) {
-            if (client->cache[index].valid && client->cache[index].state == CXL_MEMSIM_V2_STATE_M) {
-                dirty_address = client->cache[index].address;
-                found = true;
-                break;
-            }
-        }
-        qemu_mutex_unlock(&client->cache_lock);
-        if (!found) {
+        line = QTAILQ_FIRST(&client->modified);
+        if (!line) {
+            qemu_mutex_unlock(&client->cache_lock);
             break;
         }
+        assert(line->valid && line->state == CXL_MEMSIM_V2_STATE_M);
+        dirty_address = line->address;
+        client->fence_cache_visits++;
+        visits++;
+        qemu_mutex_unlock(&client->cache_lock);
         if (!cxl_memsim_v2_cache_evict_address(client, dirty_address, timeout_ms, errp)) {
-            qemu_mutex_unlock(&client->operation_lock);
-            return false;
+            success = false;
+            goto out;
         }
     }
+    released = g_get_monotonic_time();
     cxl_memsim_v2_frame_init(&request, CXL_MEMSIM_V2_OP_FENCE);
     success = cxl_memsim_v2_client_transact(client, &request, &response, timeout_ms, errp) &&
               cxl_memsim_v2_response_ok(client, &request, &response, errp) && response.state == CXL_MEMSIM_V2_STATE_I &&
               response.epoch == 0 && response.payload_len == 0;
     if (!success && errp && !*errp) {
         error_setg(errp, "invalid CXLMemSim v2 fence response");
+    }
+out:
+    if (!success || g_get_monotonic_time() - started >= 100000) {
+        error_report("CXL_MEMSIM_V2_FENCE_TIMING endpoint=%u visits=%" PRIu64
+                     " queue_us=%" PRId64 " release_us=%" PRId64
+                     " backend_fence_us=%" PRId64 " drain_us=%" PRId64 " success=%u",
+                     client->endpoint, visits, acquired - started,
+                     (released ? released : g_get_monotonic_time()) - acquired,
+                     released ? g_get_monotonic_time() - released : 0,
+                     g_get_monotonic_time() - acquired, success);
     }
     qemu_mutex_unlock(&client->operation_lock);
     return success;
@@ -1470,6 +1550,16 @@ void cxl_memsim_v2_client_free(CxlMemsimV2Client *client) {
 
 uint16_t cxl_memsim_v2_client_endpoint(CxlMemsimV2Client *client) {
     return client ? client->endpoint : CXL_MEMSIM_V2_SERVER_ENDPOINT;
+}
+
+uint64_t cxl_memsim_v2_client_fence_cache_visits(CxlMemsimV2Client *client)
+{
+    uint64_t visits;
+
+    qemu_mutex_lock(&client->cache_lock);
+    visits = client->fence_cache_visits;
+    qemu_mutex_unlock(&client->cache_lock);
+    return visits;
 }
 
 uint64_t cxl_memsim_v2_client_session(CxlMemsimV2Client *client) {

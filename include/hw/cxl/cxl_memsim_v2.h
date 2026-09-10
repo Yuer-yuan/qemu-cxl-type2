@@ -183,6 +183,8 @@ bool cxl_memsim_v2_fence(CxlMemsimV2Client *client, int timeout_ms,
 uint16_t cxl_memsim_v2_client_endpoint(CxlMemsimV2Client *client);
 uint64_t cxl_memsim_v2_client_session(CxlMemsimV2Client *client);
 unsigned cxl_memsim_v2_client_progress_starts(CxlMemsimV2Client *client);
+/* Read-only work accounting, not a persistence operation. */
+uint64_t cxl_memsim_v2_client_fence_cache_visits(CxlMemsimV2Client *client);
 CxlMemsimV2Client *cxl_memsim_v2_path_client(
     CxlMemsimV2EndpointPair *endpoints, CxlMemsimV2Path path);
 
