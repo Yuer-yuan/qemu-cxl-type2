@@ -21,6 +21,7 @@ typedef struct CxlType3MemsimV2Config {
     uint32_t timeout_ms;
     bool write_through;
     bool read_exclusive;
+    bool gpf;
 } CxlType3MemsimV2Config;
 
 typedef struct CxlType3MemsimV2 {
@@ -43,5 +44,8 @@ MemTxResult cxl_type3_memsim_v2_write(CxlType3MemsimV2 *state,
 MemTxResult cxl_type3_memsim_v2_cache_block(CxlType3MemsimV2 *state,
                                             uint64_t dpa);
 MemTxResult cxl_type3_memsim_v2_persist(CxlType3MemsimV2 *state);
+bool cxl_type3_memsim_v2_gpf(CxlType3MemsimV2 *state, unsigned phase,
+                             Error **errp);
+uint16_t cxl_type3_memsim_v2_gpf_duration(const CxlType3MemsimV2Config *config);
 
 #endif /* CXL_TYPE3_MEMSIM_V2_H */

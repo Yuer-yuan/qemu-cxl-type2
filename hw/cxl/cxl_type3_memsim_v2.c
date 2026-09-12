@@ -35,6 +35,15 @@ bool cxl_type3_memsim_v2_validate(const CxlType3MemsimV2Config *config,
         error_setg(errp, "missing CXL Type-3 CXLMemSim v2 configuration");
         return false;
     }
+    if (config->gpf && !config->enabled) {
+        error_setg(errp, "CXL Type-3 x-gpf requires coherence-v2");
+        return false;
+    }
+    if (config->gpf && config->timeout_ms > 75000) {
+        error_setg(errp, "CXL Type-3 GPF timeout including retry exceeds "
+                   "the 150 second DVSEC duration range");
+        return false;
+    }
     if (!config->enabled) {
         return true;
     }
@@ -91,7 +100,9 @@ bool cxl_type3_memsim_v2_realize(CxlType3MemsimV2 *state, Error **errp)
         error_setg(errp, "cannot allocate CXL Type-3 CXLMemSim v2 client");
         return false;
     }
-    if (!cxl_memsim_v2_client_set_write_policy(
+    if ((state->config.gpf &&
+         !cxl_memsim_v2_client_enable_gpf(state->client, &local_err)) ||
+        !cxl_memsim_v2_client_set_write_policy(
             state->client, CXL_MEMSIM_V2_WRITE_BACK, &local_err) ||
         !cxl_memsim_v2_client_connect(
             state->client, state->config.server_host, state->config.server_port,
@@ -185,4 +196,28 @@ MemTxResult cxl_type3_memsim_v2_persist(CxlType3MemsimV2 *state)
         return MEMTX_ERROR;
     }
     return MEMTX_OK;
+}
+
+bool cxl_type3_memsim_v2_gpf(CxlType3MemsimV2 *state, unsigned phase,
+                             Error **errp)
+{
+    if (!state || !state->enabled || !state->client || !state->config.gpf) {
+        error_setg(errp, "CXL Type-3 GPF functional model is not enabled");
+        return false;
+    }
+    return cxl_memsim_v2_gpf(state->client, phase,
+                             state->config.timeout_ms, errp);
+}
+
+uint16_t cxl_type3_memsim_v2_gpf_duration(const CxlType3MemsimV2Config *config)
+{
+    /* Round up the Phase 2 response deadline, including one transport retry. */
+    uint64_t duration_us = 2ULL * config->timeout_ms * 1000;
+    unsigned scale = 0;
+
+    while (duration_us > 15 && scale < 7) {
+        duration_us = DIV_ROUND_UP(duration_us, 10);
+        scale++;
+    }
+    return (scale << 8) | duration_us;
 }

@@ -8,6 +8,31 @@
 ##
 
 ##
+# @x-cxl-gpf:
+#
+# Execute a phase of the CXLMemSim Type 3 Global Persistent Flush model.
+# The VM must be stopped and the endpoint must have x-gpf enabled. Phase 1
+# freezes local accesses and drains dirty cache lines. Complete Phase 1 on
+# every endpoint sharing the server before requesting Phase 2, which flushes
+# the persistent backing file. Endpoints remain frozen until process restart.
+# This experimental command models the persistence handoff, not PCIe PM VDM
+# packets, power budgets or physical media power-loss protection.
+#
+# @path: CXL Type 3 device QOM path
+#
+# @phase: 1 for endpoint drain, 2 for global persistence completion
+#
+# Features:
+#
+# @unstable: This command is a private functional-model interface.
+#
+# Since: 10.1
+##
+{ 'command': 'x-cxl-gpf',
+  'data': { 'path': 'str', 'phase': 'uint8' },
+  'features': [ 'unstable' ] }
+
+##
 # @CxlEventLog:
 #
 # CXL has a number of separate event logs for different types of

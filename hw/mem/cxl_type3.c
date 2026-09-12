@@ -28,6 +28,7 @@
 #include "qemu/guest-random.h"
 #include "system/hostmem.h"
 #include "system/numa.h"
+#include "system/runstate.h"
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
@@ -398,13 +399,17 @@ static void build_dvsecs(CXLType3Dev *ct3d)
     cxl_component_create_dvsec(cxl_cstate, CXL2_TYPE3_DEVICE,
                                REG_LOC_DVSEC_LENGTH, REG_LOC_DVSEC,
                                REG_LOC_DVSEC_REVID, dvsec);
-    dvsec = (uint8_t *)&(CXLDVSECDeviceGPF){
-        .phase2_duration = 0x603, /* 3 seconds */
-        .phase2_power = 0x33, /* 0x33 miliwatts */
-    };
-    cxl_component_create_dvsec(cxl_cstate, CXL2_TYPE3_DEVICE,
-                               GPF_DEVICE_DVSEC_LENGTH, GPF_DEVICE_DVSEC,
-                               GPF_DEVICE_DVSEC_REVID, dvsec);
+    if (!ct3d->memsim_v2.config.enabled || ct3d->memsim_v2.config.gpf) {
+        dvsec = (uint8_t *)&(CXLDVSECDeviceGPF){
+            .phase2_duration = ct3d->memsim_v2.config.gpf ?
+                cxl_type3_memsim_v2_gpf_duration(&ct3d->memsim_v2.config) :
+                0x603,
+            .phase2_power = ct3d->memsim_v2.config.gpf ? 0 : 0x33,
+        };
+        cxl_component_create_dvsec(cxl_cstate, CXL2_TYPE3_DEVICE,
+                                   GPF_DEVICE_DVSEC_LENGTH, GPF_DEVICE_DVSEC,
+                                   GPF_DEVICE_DVSEC_REVID, dvsec);
+    }
 
     dvsec = (uint8_t *)&(CXLDVSECPortFlexBus){
         .cap                     = 0x26, /* 68B/256B, IO, Mem, non-MLD */
@@ -899,6 +904,16 @@ static void ct3_realize(PCIDevice *pci_dev, Error **errp)
         error_setg(errp, "coherence-v2 and hdm-db must be enabled together");
         return;
     }
+    ct3d->memsim_v2.config.server_host = ct3d->memsim_v2_server_host ?
+        ct3d->memsim_v2_server_host : "127.0.0.1";
+    if (!cxl_type3_memsim_v2_validate(&ct3d->memsim_v2.config, errp)) {
+        return;
+    }
+    if (ct3d->memsim_v2.config.gpf &&
+        (!ct3d->hostpmem || ct3d->hostvmem || ct3d->dc.num_regions)) {
+        error_setg(errp, "x-gpf requires a persistent-only Type-3 endpoint");
+        return;
+    }
 
     if (!cxl_setup_memory(ct3d, errp)) {
         return;
@@ -987,14 +1002,6 @@ static void ct3_realize(PCIDevice *pci_dev, Error **errp)
         ct3d->ecs_attrs.fru_attrs[count].ecs_flags = 0;
     }
 
-    if (ct3d->memsim_v2.config.enabled) {
-        if (ct3d->memsim_v2_server_host) {
-            ct3d->memsim_v2.config.server_host =
-                ct3d->memsim_v2_server_host;
-        } else {
-            ct3d->memsim_v2.config.server_host = "127.0.0.1";
-        }
-    }
     if (!cxl_type3_memsim_v2_realize(&ct3d->memsim_v2, errp)) {
         goto err_aer_exit;
     }
@@ -2686,6 +2693,7 @@ static const Property ct3_props[] = {
                        memsim_gfam_host_id, 0),
     DEFINE_PROP_BOOL("coherence-v2", CXLType3Dev,
                      memsim_v2.config.enabled, false),
+    DEFINE_PROP_BOOL("x-gpf", CXLType3Dev, memsim_v2.config.gpf, false),
     DEFINE_PROP_STRING("cxlmemsim-addr", CXLType3Dev,
                        memsim_v2_server_host),
     DEFINE_PROP_UINT16("cxlmemsim-port", CXLType3Dev,
@@ -2881,6 +2889,23 @@ void cxl_clear_poison_list_overflowed(CXLType3Dev *ct3d)
 {
     ct3d->poison_list_overflowed = false;
     ct3d->poison_list_overflow_ts = 0;
+}
+
+void qmp_x_cxl_gpf(const char *path, uint8_t phase, Error **errp)
+{
+    Object *obj = object_resolve_path(path, NULL);
+    CXLType3Dev *ct3d;
+
+    if (!obj || !object_dynamic_cast(obj, TYPE_CXL_TYPE3)) {
+        error_setg(errp, "GPF path must resolve to a CXL Type-3 device");
+        return;
+    }
+    if (runstate_is_running()) {
+        error_setg(errp, "Stop the VM before initiating GPF");
+        return;
+    }
+    ct3d = CXL_TYPE3(obj);
+    cxl_type3_memsim_v2_gpf(&ct3d->memsim_v2, phase, errp);
 }
 
 void qmp_cxl_inject_poison(const char *path, uint64_t start, uint64_t length,

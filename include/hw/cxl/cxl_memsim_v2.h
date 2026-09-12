@@ -20,6 +20,7 @@
 
 #define CXL_MEMSIM_V2_CAP_MODEL_SNOOP (UINT64_C(1) << 0)
 #define CXL_MEMSIM_V2_CAP_NATIVE_FLUSH (UINT64_C(1) << 1)
+#define CXL_MEMSIM_V2_CAP_MODEL_GPF (UINT64_C(1) << 2)
 
 typedef enum CxlMemsimV2Opcode {
     CXL_MEMSIM_V2_OP_REGISTER = 0x0001,
@@ -34,6 +35,8 @@ typedef enum CxlMemsimV2Opcode {
     CXL_MEMSIM_V2_OP_FENCE = 0x000a,
     CXL_MEMSIM_V2_OP_SNOOP_ACK = 0x000b,
     CXL_MEMSIM_V2_OP_HEARTBEAT = 0x000c,
+    CXL_MEMSIM_V2_OP_GPF_PHASE1 = 0x000d,
+    CXL_MEMSIM_V2_OP_GPF_PHASE2 = 0x000e,
     CXL_MEMSIM_V2_OP_RESPONSE = 0x8001,
     CXL_MEMSIM_V2_OP_SNP_INV = 0x8101,
     CXL_MEMSIM_V2_OP_SNP_DOWNGRADE = 0x8102,
@@ -133,6 +136,8 @@ CxlMemsimV2Client *cxl_memsim_v2_client_new(
     void *snoop_opaque);
 bool cxl_memsim_v2_client_set_write_policy(
     CxlMemsimV2Client *client, CxlMemsimV2WritePolicy policy, Error **errp);
+/* Must be enabled before registration; an unsupported backend fails realize. */
+bool cxl_memsim_v2_client_enable_gpf(CxlMemsimV2Client *client, Error **errp);
 
 /* Takes ownership of fd on both success and failure. */
 bool cxl_memsim_v2_client_start_fd(CxlMemsimV2Client *client, int fd,
@@ -179,6 +184,9 @@ bool cxl_memsim_v2_compare_exchange(
     int timeout_ms, Error **errp);
 bool cxl_memsim_v2_fence(CxlMemsimV2Client *client, int timeout_ms,
                          Error **errp);
+/* Phase 1 freezes ordinary accesses until process restart, even on failure. */
+bool cxl_memsim_v2_gpf(CxlMemsimV2Client *client, unsigned phase,
+                       int timeout_ms, Error **errp);
 
 uint16_t cxl_memsim_v2_client_endpoint(CxlMemsimV2Client *client);
 uint64_t cxl_memsim_v2_client_session(CxlMemsimV2Client *client);

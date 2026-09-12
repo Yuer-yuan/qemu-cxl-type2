@@ -69,6 +69,9 @@ struct CxlMemsimV2Client {
     bool connected;
     bool response_ack_in_progress;
     bool progress_joinable;
+    bool gpf_enabled;
+    bool gpf_frozen;       /* protected by operation_lock */
+    bool gpf_phase1_done;  /* protected by operation_lock */
 };
 
 QEMU_BUILD_BUG_ON(sizeof(CxlMemsimV2Frame) != CXL_MEMSIM_V2_FRAME_SIZE);
@@ -123,6 +126,8 @@ static bool cxl_memsim_v2_known_opcode(uint16_t opcode) {
     case CXL_MEMSIM_V2_OP_FENCE:
     case CXL_MEMSIM_V2_OP_SNOOP_ACK:
     case CXL_MEMSIM_V2_OP_HEARTBEAT:
+    case CXL_MEMSIM_V2_OP_GPF_PHASE1:
+    case CXL_MEMSIM_V2_OP_GPF_PHASE2:
     case CXL_MEMSIM_V2_OP_RESPONSE:
     case CXL_MEMSIM_V2_OP_SNP_INV:
     case CXL_MEMSIM_V2_OP_SNP_DOWNGRADE:
@@ -658,6 +663,24 @@ bool cxl_memsim_v2_client_set_write_policy(CxlMemsimV2Client *client, CxlMemsimV
     return true;
 }
 
+bool cxl_memsim_v2_client_enable_gpf(CxlMemsimV2Client *client, Error **errp)
+{
+    if (!client) {
+        error_setg(errp, "missing CXLMemSim v2 GPF client");
+        return false;
+    }
+    qemu_mutex_lock(&client->state_lock);
+    if (client->started) {
+        qemu_mutex_unlock(&client->state_lock);
+        error_setg(errp, "CXLMemSim v2 GPF must be enabled "
+                   "before registration");
+        return false;
+    }
+    client->gpf_enabled = true;
+    qemu_mutex_unlock(&client->state_lock);
+    return true;
+}
+
 static bool cxl_memsim_v2_transact_internal(CxlMemsimV2Client *client, CxlMemsimV2Frame *request,
                                             CxlMemsimV2Frame *response, int timeout_ms, bool registration,
                                             Error **errp) {
@@ -818,6 +841,9 @@ bool cxl_memsim_v2_client_start_fd(CxlMemsimV2Client *client, int fd, uint32_t c
 
     cxl_memsim_v2_frame_init(&request, CXL_MEMSIM_V2_OP_REGISTER);
     request.capabilities = CXL_MEMSIM_V2_CAP_MODEL_SNOOP;
+    if (client->gpf_enabled) {
+        request.capabilities |= CXL_MEMSIM_V2_CAP_MODEL_GPF;
+    }
     request.expected = cache_ways;
     request.value = cache_capacity;
     request.size = CXL_MEMSIM_V2_LINE_SIZE;
@@ -825,9 +851,11 @@ bool cxl_memsim_v2_client_start_fd(CxlMemsimV2Client *client, int fd, uint32_t c
         goto fail;
     }
     if (response.status != CXL_MEMSIM_V2_STATUS_OK || response.ack_strength != CXL_MEMSIM_V2_ACK_MODEL ||
-        response.capabilities != CXL_MEMSIM_V2_CAP_MODEL_SNOOP || response.size != CXL_MEMSIM_V2_LINE_SIZE ||
+        response.capabilities != request.capabilities ||
+        response.size != CXL_MEMSIM_V2_LINE_SIZE ||
         response.value != cache_capacity || response.expected != cache_ways || !response.old_value) {
-        error_setg(&local_err, "CXLMemSim v2 registration response is invalid");
+        error_setg(&local_err, "CXLMemSim v2 registration response is invalid "
+                   "or requested GPF capability is unavailable");
         goto fail;
     }
     qemu_mutex_lock(&client->state_lock);
@@ -1240,6 +1268,18 @@ static bool cxl_memsim_v2_access_size_valid(uint64_t address, unsigned size) {
     return (size == 1 || size == 2 || size == 4 || size == 8) && address <= UINT64_MAX - size;
 }
 
+/* Caller owns operation_lock. Cache hits must obey the same cut as misses. */
+static bool cxl_memsim_v2_access_allowed(CxlMemsimV2Client *client,
+                                        Error **errp)
+{
+    if (client->gpf_frozen) {
+        error_setg(errp, "CXLMemSim v2 endpoint is frozen by GPF; "
+                   "restart required");
+        return false;
+    }
+    return true;
+}
+
 static bool cxl_memsim_v2_load_policy(CxlMemsimV2Client *client,
                                       uint64_t address, unsigned size,
                                       uint64_t *value, int timeout_ms,
@@ -1254,6 +1294,9 @@ static bool cxl_memsim_v2_load_policy(CxlMemsimV2Client *client,
         return false;
     }
     qemu_mutex_lock(&client->operation_lock);
+    if (!cxl_memsim_v2_access_allowed(client, errp)) {
+        goto out;
+    }
     while (copied < size) {
         CxlMemsimV2CacheLine *line;
         uint64_t line_address = cursor & ~(uint64_t)(CXL_MEMSIM_V2_LINE_SIZE - 1);
@@ -1310,6 +1353,9 @@ bool cxl_memsim_v2_store(CxlMemsimV2Client *client, uint64_t address, unsigned s
     }
     stn_le_p(bytes, size, value);
     qemu_mutex_lock(&client->operation_lock);
+    if (!cxl_memsim_v2_access_allowed(client, errp)) {
+        goto out;
+    }
     while (copied < size) {
         CxlMemsimV2CacheLine *line;
         uint64_t line_address = cursor & ~(uint64_t)(CXL_MEMSIM_V2_LINE_SIZE - 1);
@@ -1352,7 +1398,8 @@ bool cxl_memsim_v2_cache_block(CxlMemsimV2Client *client,
     }
     line_address = address & ~(uint64_t)(CXL_MEMSIM_V2_LINE_SIZE - 1);
     qemu_mutex_lock(&client->operation_lock);
-    success = cxl_memsim_v2_cache_evict_address(
+    success = cxl_memsim_v2_access_allowed(client, errp) &&
+              cxl_memsim_v2_cache_evict_address(
         client, line_address, timeout_ms, errp);
     qemu_mutex_unlock(&client->operation_lock);
     return success;
@@ -1374,6 +1421,9 @@ static bool cxl_memsim_v2_atomic(CxlMemsimV2Client *client, CxlMemsimV2Opcode op
         return false;
     }
     qemu_mutex_lock(&client->operation_lock);
+    if (!cxl_memsim_v2_access_allowed(client, errp)) {
+        goto out;
+    }
     line_address = address & ~(uint64_t)(CXL_MEMSIM_V2_LINE_SIZE - 1);
     if (!cxl_memsim_v2_cache_evict_address(client, line_address, timeout_ms, errp) ||
         !cxl_memsim_v2_cache_make_room(client, line_address, timeout_ms, errp)) {
@@ -1428,21 +1478,10 @@ bool cxl_memsim_v2_compare_exchange(CxlMemsimV2Client *client, uint64_t address,
                                 timeout_ms, errp);
 }
 
-bool cxl_memsim_v2_fence(CxlMemsimV2Client *client, int timeout_ms, Error **errp) {
-    CxlMemsimV2Frame request;
-    CxlMemsimV2Frame response;
-    bool success;
-    int64_t started = g_get_monotonic_time();
-    int64_t acquired;
-    int64_t released = 0;
-    uint64_t visits = 0;
-
-    if (!client) {
-        error_setg(errp, "invalid CXLMemSim v2 fence client");
-        return false;
-    }
-    qemu_mutex_lock(&client->operation_lock);
-    acquired = g_get_monotonic_time();
+static bool cxl_memsim_v2_drain_modified(CxlMemsimV2Client *client,
+                                        int timeout_ms, uint64_t *visits,
+                                        Error **errp)
+{
     /*
      * Local additions/replacements are excluded by operation_lock. Snoops
      * can remove M holders, never add them. Each iteration therefore visits
@@ -1462,12 +1501,35 @@ bool cxl_memsim_v2_fence(CxlMemsimV2Client *client, int timeout_ms, Error **errp
         assert(line->valid && line->state == CXL_MEMSIM_V2_STATE_M);
         dirty_address = line->address;
         client->fence_cache_visits++;
-        visits++;
+        (*visits)++;
         qemu_mutex_unlock(&client->cache_lock);
         if (!cxl_memsim_v2_cache_evict_address(client, dirty_address, timeout_ms, errp)) {
-            success = false;
-            goto out;
+            return false;
         }
+    }
+    return true;
+}
+
+bool cxl_memsim_v2_fence(CxlMemsimV2Client *client, int timeout_ms,
+                         Error **errp)
+{
+    CxlMemsimV2Frame request;
+    CxlMemsimV2Frame response;
+    bool success = false;
+    int64_t started = g_get_monotonic_time();
+    int64_t acquired;
+    int64_t released = 0;
+    uint64_t visits = 0;
+
+    if (!client) {
+        error_setg(errp, "invalid CXLMemSim v2 fence client");
+        return false;
+    }
+    qemu_mutex_lock(&client->operation_lock);
+    acquired = g_get_monotonic_time();
+    if (!cxl_memsim_v2_access_allowed(client, errp) ||
+        !cxl_memsim_v2_drain_modified(client, timeout_ms, &visits, errp)) {
+        goto out;
     }
     released = g_get_monotonic_time();
     cxl_memsim_v2_frame_init(&request, CXL_MEMSIM_V2_OP_FENCE);
@@ -1491,6 +1553,53 @@ out:
     return success;
 }
 
+bool cxl_memsim_v2_gpf(CxlMemsimV2Client *client, unsigned phase,
+                       int timeout_ms, Error **errp)
+{
+    CxlMemsimV2Frame request;
+    CxlMemsimV2Frame response;
+    uint64_t visits = 0;
+    bool success = false;
+
+    if (!client || !client->gpf_enabled || (phase != 1 && phase != 2) ||
+        timeout_ms <= 0) {
+        error_setg(errp, "invalid or disabled CXLMemSim v2 GPF request");
+        return false;
+    }
+    qemu_mutex_lock(&client->operation_lock);
+    if (phase == 2 && !client->gpf_phase1_done) {
+        error_setg(errp, "GPF Phase 2 requires successful local Phase 1");
+        goto out;
+    }
+    if (phase == 1) {
+        client->gpf_frozen = true;
+        if (!cxl_memsim_v2_drain_modified(client, timeout_ms, &visits, errp)) {
+            goto out;
+        }
+    }
+    cxl_memsim_v2_frame_init(&request, phase == 1 ?
+                            CXL_MEMSIM_V2_OP_GPF_PHASE1 :
+                            CXL_MEMSIM_V2_OP_GPF_PHASE2);
+    success = cxl_memsim_v2_client_transact(client, &request, &response,
+                                            timeout_ms, errp) &&
+              cxl_memsim_v2_response_ok(client, &request, &response, errp);
+    if (success && (response.state != CXL_MEMSIM_V2_STATE_I ||
+                    response.epoch || response.payload_len ||
+                    response.ack_strength || response.capabilities ||
+                    response.expected || response.value ||
+                    response.old_value || response.size)) {
+        error_setg(errp, "invalid CXLMemSim v2 GPF completion");
+        cxl_memsim_v2_disconnect(client, "invalid GPF completion");
+        success = false;
+    }
+    if (success && phase == 1) {
+        client->gpf_phase1_done = true;
+    }
+out:
+    qemu_mutex_unlock(&client->operation_lock);
+    return success;
+}
+
 void cxl_memsim_v2_client_free(CxlMemsimV2Client *client) {
     if (!client) {
         return;
@@ -1506,7 +1615,7 @@ void cxl_memsim_v2_client_free(CxlMemsimV2Client *client) {
         qemu_mutex_lock(&client->state_lock);
         connected = client->connected && client->session_id;
         qemu_mutex_unlock(&client->state_lock);
-        if (connected) {
+        if (connected && !client->gpf_frozen) {
             fence_ok = cxl_memsim_v2_fence(client, client->timeout_ms, &local_err);
             error_free(local_err);
             local_err = NULL;

@@ -147,6 +147,7 @@ static void test_type3_coherence_v2_properties(void)
 {
     static const char * const expected[] = {
         "coherence-v2",
+        "x-gpf",
         "cxlmemsim-addr",
         "cxlmemsim-port",
         "coherence-v2-host-id",
@@ -427,9 +428,75 @@ static void test_firmware_files(void)
     qtest_quit(qts);
 }
 
+static unsigned find_gpf_dvsec(QTestState *qts, uint64_t config, unsigned id)
+{
+    unsigned offset = 0x100;
+    unsigned ttl = 256;
+
+    while (offset && ttl--) {
+        uint32_t header = qtest_readl(qts, config + offset);
+
+        if ((header & 0xffff) == 0x23 &&
+            qtest_readw(qts, config + offset + 4) == 0x1e98 &&
+            qtest_readw(qts, config + offset + 8) == id) {
+            g_assert_cmphex(qtest_readl(qts, config + offset + 4) >> 20,
+                            ==, 0x10);
+            return offset;
+        }
+        offset = header >> 20;
+    }
+    g_assert_not_reached();
+}
+
+static void test_gpf_dvsec_attributes(void)
+{
+    QTestState *qts = qtest_init(
+        "-machine sifive_u,cxl=on -cpu veyron-v1 -smp 5 -S "
+        "-object memory-backend-ram,id=mem,size=256M "
+        "-object memory-backend-ram,id=lsa,size=2M "
+        "-device pxb-cxl,bus=pcie.0,bus_nr=64,id=cxl.1 "
+        "-device cxl-rp,bus=cxl.1,port=0,id=rp,chassis=0,slot=0 "
+        "-device cxl-type3,bus=rp,persistent-memdev=mem,lsa=lsa,id=t3");
+    uint64_t port = SIFIVE_U_PCIE_ECAM_BASE + (64ULL << 20);
+    uint64_t device = SIFIVE_U_PCIE_ECAM_BASE + (65ULL << 20);
+    unsigned offset;
+    uint16_t duration;
+    uint32_t power;
+    QDict *response;
+
+    qtest_writeb(qts, port + PCI_PRIMARY_BUS, 64);
+    qtest_writeb(qts, port + PCI_SECONDARY_BUS, 65);
+    qtest_writeb(qts, port + PCI_SUBORDINATE_BUS, 65);
+    offset = find_gpf_dvsec(qts, port, 4);
+    qtest_writel(qts, port + offset + 12, 0xffffffff);
+    g_assert_cmphex(qtest_readl(qts, port + offset + 12), ==, 0x0f0f0f0f);
+    qtest_writew(qts, port + offset + 12, 0x0702);
+    qtest_writew(qts, port + offset + 14, 0x0702);
+    g_assert_cmphex(qtest_readl(qts, port + offset + 12), ==, 0x07020702);
+
+    offset = find_gpf_dvsec(qts, device, 5);
+    duration = qtest_readw(qts, device + offset + 10);
+    power = qtest_readl(qts, device + offset + 12);
+    g_assert_cmphex(duration, ==, 0x0603);
+    g_assert_cmphex(power, ==, 0x33);
+    qtest_writew(qts, device + offset + 10, ~duration);
+    qtest_writel(qts, device + offset + 12, ~power);
+    g_assert_cmphex(qtest_readw(qts, device + offset + 10), ==, duration);
+    g_assert_cmphex(qtest_readl(qts, device + offset + 12), ==, power);
+    qtest_writeb(qts, device + offset + 10, 0xff);
+    qtest_writeb(qts, device + offset + 11, 0xff);
+    g_assert_cmphex(qtest_readw(qts, device + offset + 10), ==, duration);
+    response = qtest_qmp(qts, "{'execute':'x-cxl-gpf',"
+                         "'arguments':{'path':'/machine/peripheral/t3','phase':1}}");
+    g_assert_true(qdict_haskey(response, "error"));
+    qobject_unref(response);
+    qtest_quit(qts);
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
+    qtest_add_func("/riscv/sifive-u/cxl/gpf-dvsec", test_gpf_dvsec_attributes);
     qtest_add_func("/riscv/sifive-u/cxl/type3-coherence-v2-properties",
                    test_type3_coherence_v2_properties);
     qtest_add_func("/riscv/sifive-u/cxl/firmware-files",

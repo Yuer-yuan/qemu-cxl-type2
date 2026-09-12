@@ -40,6 +40,10 @@ typedef enum CachePeerScript {
     CACHE_PEER_FENCE_WORKLIST,
     CACHE_PEER_FENCE_WORKLIST_SNOOP,
     CACHE_PEER_TCP_STREAM,
+    CACHE_PEER_GPF,
+    CACHE_PEER_GPF_FAILURE,
+    CACHE_PEER_GPF_TIMEOUT,
+    CACHE_PEER_GPF_NO_CAP,
 } CachePeerScript;
 
 typedef struct CachePeer {
@@ -167,7 +171,8 @@ static bool send_registration_response(CachePeer *peer, const uint8_t *request) 
     put_le16(response, 16, CXL_MEMSIM_V2_SERVER_ENDPOINT);
     put_le16(response, 18, get_le16(request, 16));
     put_le64(response, 40, TEST_SESSION);
-    put_le64(response, 64, CXL_MEMSIM_V2_CAP_MODEL_SNOOP);
+    put_le64(response, 64, peer->script == CACHE_PEER_GPF_NO_CAP ?
+             CXL_MEMSIM_V2_CAP_MODEL_SNOOP : get_le64(request, 64));
     put_le64(response, 72, get_le64(request, 72));
     put_le64(response, 80, get_le64(request, 80));
     put_le64(response, 88, 1);
@@ -851,6 +856,44 @@ static bool run_tcp_stream_script(CachePeer *peer, uint8_t *frame)
     return expect_fence(peer, frame) && expect_clean_teardown(peer, frame);
 }
 
+static bool run_gpf_script(CachePeer *peer, uint8_t *frame)
+{
+    uint8_t line[CXL_MEMSIM_V2_LINE_SIZE] = {0};
+
+    if (!expect_frame(peer, CXL_MEMSIM_V2_OP_GETS, frame) ||
+        !send_response(peer, frame, CXL_MEMSIM_V2_STATE_E, 1, line, 0) ||
+        !expect_frame(peer, CXL_MEMSIM_V2_OP_GETM, frame) ||
+        !send_response(peer, frame, CXL_MEMSIM_V2_STATE_M, 1, line, 0) ||
+        !expect_putm(peer, frame, TEST_LINE_B, TEST_VALUE_B, 2) ||
+        !expect_frame(peer, CXL_MEMSIM_V2_OP_GPF_PHASE1, frame)) {
+        return false;
+    }
+    if (peer->script == CACHE_PEER_GPF_FAILURE) {
+        if (!send_error_response(peer, frame, CXL_MEMSIM_V2_STATUS_IO_ERROR) ||
+            !expect_frame(peer, CXL_MEMSIM_V2_OP_GPF_PHASE1, frame)) {
+            return false;
+        }
+    }
+    if (!send_response(peer, frame, CXL_MEMSIM_V2_STATE_I, 0, NULL, 0) ||
+        !expect_frame(peer, CXL_MEMSIM_V2_OP_GPF_PHASE2, frame)) {
+        return false;
+    }
+    if (peer->script == CACHE_PEER_GPF_FAILURE) {
+        if (!send_error_response(peer, frame, CXL_MEMSIM_V2_STATUS_IO_ERROR) ||
+            !expect_frame(peer, CXL_MEMSIM_V2_OP_GPF_PHASE2, frame)) {
+            return false;
+        }
+    }
+    if (peer->script == CACHE_PEER_GPF_TIMEOUT) {
+        uint64_t original_id = get_le64(frame, 24);
+
+        /* Drop both responses; the client must retry the same request ID. */
+        return expect_frame(peer, CXL_MEMSIM_V2_OP_GPF_PHASE2, frame) &&
+               get_le64(frame, 24) == original_id;
+    }
+    return send_response(peer, frame, CXL_MEMSIM_V2_STATE_I, 0, NULL, 0);
+}
+
 static gpointer cache_peer_thread(gpointer opaque) {
     CachePeer *peer = opaque;
     uint8_t frame[CXL_MEMSIM_V2_FRAME_SIZE];
@@ -917,6 +960,14 @@ static gpointer cache_peer_thread(gpointer opaque) {
     case CACHE_PEER_TCP_STREAM:
         success = run_tcp_stream_script(peer, frame);
         break;
+    case CACHE_PEER_GPF:
+    case CACHE_PEER_GPF_FAILURE:
+    case CACHE_PEER_GPF_TIMEOUT:
+        success = run_gpf_script(peer, frame);
+        break;
+    case CACHE_PEER_GPF_NO_CAP:
+        success = true;
+        break;
     }
     if (!success && !peer->error_code) {
         peer->error_code = EPROTO;
@@ -977,6 +1028,12 @@ static CxlMemsimV2Client *start_cache_client(CachePeer *peer, uint32_t cache_cap
     *peer_thread = g_thread_new("memsim-v2-cache-peer", cache_peer_thread, peer);
     client = cxl_memsim_v2_client_new(CXL_MEMSIM_V2_DEVICE_ENDPOINT, NULL, NULL);
     g_assert_nonnull(client);
+    if (peer->script == CACHE_PEER_GPF ||
+        peer->script == CACHE_PEER_GPF_FAILURE ||
+        peer->script == CACHE_PEER_GPF_TIMEOUT) {
+        g_assert_true(cxl_memsim_v2_client_enable_gpf(client, &err));
+        g_assert_null(err);
+    }
     if (peer->script == CACHE_PEER_WRITE_THROUGH) {
         g_assert_true(cxl_memsim_v2_client_set_write_policy(client, CXL_MEMSIM_V2_WRITE_THROUGH, &err));
         g_assert_null(err);
@@ -1412,9 +1469,112 @@ static void test_tcp_stream(gconstpointer opaque)
     finish_cache_test(&peer, peer_thread, client);
 }
 
+static void assert_gpf_frozen(CxlMemsimV2Client *client)
+{
+    Error *err = NULL;
+    uint64_t old_value, new_value;
+
+    /* Includes a clean cache hit and a dirty-line address. */
+    g_assert_false(cxl_memsim_v2_load(client, TEST_LINE_A, 8, &old_value,
+                                     TEST_TIMEOUT_MS, &err));
+    g_assert_nonnull(err);
+    g_clear_pointer(&err, error_free);
+    g_assert_false(cxl_memsim_v2_store(client, TEST_LINE_B, 8, 0,
+                                      TEST_TIMEOUT_MS, &err));
+    g_assert_nonnull(err);
+    g_clear_pointer(&err, error_free);
+    g_assert_false(cxl_memsim_v2_fetch_add(client, TEST_LINE_B, 1,
+                                          &old_value, &new_value,
+                                          TEST_TIMEOUT_MS, &err));
+    g_assert_nonnull(err);
+    g_clear_pointer(&err, error_free);
+    g_assert_false(cxl_memsim_v2_fence(client, TEST_TIMEOUT_MS, &err));
+    g_assert_nonnull(err);
+    error_free(err);
+}
+
+static void test_gpf(gconstpointer opaque)
+{
+    CachePeer peer = { .script = GPOINTER_TO_INT(opaque) };
+    GThread *peer_thread;
+    CxlMemsimV2Client *client = start_cache_client(&peer, 256, 4, &peer_thread);
+    Error *err = NULL;
+    uint64_t value;
+
+    g_assert_false(cxl_memsim_v2_gpf(client, 2, TEST_TIMEOUT_MS, &err));
+    g_assert_nonnull(err);
+    g_clear_pointer(&err, error_free);
+    g_assert_true(cxl_memsim_v2_load(client, TEST_LINE_A, 8, &value,
+                                    TEST_TIMEOUT_MS, &err));
+    g_assert_true(cxl_memsim_v2_store(client, TEST_LINE_B, 8, TEST_VALUE_B,
+                                     TEST_TIMEOUT_MS, &err));
+    g_assert_null(err);
+    if (peer.script == CACHE_PEER_GPF_FAILURE) {
+        g_assert_false(cxl_memsim_v2_gpf(client, 1, TEST_TIMEOUT_MS, &err));
+        g_assert_nonnull(err);
+        g_clear_pointer(&err, error_free);
+        assert_gpf_frozen(client);
+    }
+    g_assert_true(cxl_memsim_v2_gpf(client, 1, TEST_TIMEOUT_MS, &err));
+    g_assert_null(err);
+    assert_gpf_frozen(client);
+    if (peer.script == CACHE_PEER_GPF_FAILURE) {
+        g_assert_false(cxl_memsim_v2_gpf(client, 2, TEST_TIMEOUT_MS, &err));
+        g_assert_nonnull(err);
+        g_clear_pointer(&err, error_free);
+        assert_gpf_frozen(client);
+    }
+    if (peer.script == CACHE_PEER_GPF_TIMEOUT) {
+        g_assert_false(cxl_memsim_v2_gpf(client, 2, 50, &err));
+        g_assert_nonnull(err);
+        g_assert_nonnull(strstr(error_get_pretty(err), "timed out"));
+        g_clear_pointer(&err, error_free);
+    } else {
+        g_assert_true(cxl_memsim_v2_gpf(client, 2, TEST_TIMEOUT_MS, &err));
+        g_assert_null(err);
+    }
+    assert_gpf_frozen(client);
+    finish_cache_test(&peer, peer_thread, client);
+    g_assert_cmpuint(peer.putm, ==, 1);
+    g_assert_cmpuint(peer.fences, ==, 0);
+    g_assert_false(peer.unregistered);
+}
+
+static void test_gpf_capability_required(void)
+{
+    CachePeer peer = { .script = CACHE_PEER_GPF_NO_CAP };
+    CxlMemsimV2Client *client;
+    GThread *thread;
+    Error *err = NULL;
+    int sockets[2];
+
+    g_mutex_init(&peer.phase_lock);
+    g_cond_init(&peer.phase_changed);
+    g_assert_cmpint(socketpair(AF_UNIX, SOCK_STREAM, 0, sockets), ==, 0);
+    peer.fd = sockets[1];
+    thread = g_thread_new("gpf-no-cap", cache_peer_thread, &peer);
+    client = cxl_memsim_v2_client_new(CXL_MEMSIM_V2_DEVICE_ENDPOINT,
+                                     NULL, NULL);
+    g_assert_true(cxl_memsim_v2_client_enable_gpf(client, &err));
+    g_assert_false(cxl_memsim_v2_client_start_fd(client, sockets[0], 256, 4,
+                                               TEST_TIMEOUT_MS, &err));
+    g_assert_nonnull(strstr(error_get_pretty(err), "GPF capability"));
+    error_free(err);
+    finish_cache_test(&peer, thread, client);
+}
+
 int main(int argc, char **argv) {
     module_call_init(MODULE_INIT_QOM);
     g_test_init(&argc, &argv, NULL);
+
+    g_test_add_data_func("/cxl/memsim-v2-cache/gpf",
+                        GINT_TO_POINTER(CACHE_PEER_GPF), test_gpf);
+    g_test_add_data_func("/cxl/memsim-v2-cache/gpf-failure",
+                        GINT_TO_POINTER(CACHE_PEER_GPF_FAILURE), test_gpf);
+    g_test_add_data_func("/cxl/memsim-v2-cache/gpf-timeout",
+                        GINT_TO_POINTER(CACHE_PEER_GPF_TIMEOUT), test_gpf);
+    g_test_add_func("/cxl/memsim-v2-cache/gpf-capability-required",
+                   test_gpf_capability_required);
 
     g_test_add_func("/cxl/type2/memsim-v2-cache/wb-retain", test_wb_store_and_m_hit_do_not_putm_until_fence);
     g_test_add_data_func("/cxl/type2/memsim-v2-cache/fence-worklist",

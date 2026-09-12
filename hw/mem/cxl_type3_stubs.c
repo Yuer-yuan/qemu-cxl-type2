@@ -13,6 +13,11 @@
 #include "qapi/error.h"
 #include "qapi/qapi-commands-cxl.h"
 
+void qmp_x_cxl_gpf(const char *path, uint8_t phase, Error **errp)
+{
+    error_setg(errp, "CXL Type 3 support is not compiled in");
+}
+
 void qmp_cxl_inject_general_media_event(const char *path, CxlEventLog log,
                                         uint8_t flags, uint64_t dpa,
                                         uint8_t descriptor, uint8_t type,

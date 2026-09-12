@@ -604,12 +604,7 @@ void cxl_component_create_dvsec(CXLComponentState *cxl,
         wmask[offset + offsetof(CXLDVSECPortGPF, phase2_ctrl) + 1] = 0x0F;
         break;
     case GPF_DEVICE_DVSEC:
-        wmask[offset + offsetof(CXLDVSECDeviceGPF, phase2_duration)] = 0x0F;
-        wmask[offset + offsetof(CXLDVSECDeviceGPF, phase2_duration) + 1] = 0x0F;
-        wmask[offset + offsetof(CXLDVSECDeviceGPF, phase2_power)] = 0xFF;
-        wmask[offset + offsetof(CXLDVSECDeviceGPF, phase2_power) + 1] = 0xFF;
-        wmask[offset + offsetof(CXLDVSECDeviceGPF, phase2_power) + 2] = 0xFF;
-        wmask[offset + offsetof(CXLDVSECDeviceGPF, phase2_power) + 3] = 0xFF;
+        /* Device duration and power are RO (CXL 3.1, 8.1.7.1/2). */
         break;
     case PCIE_FLEXBUS_PORT_DVSEC:
         switch (cxl_dev_type) {

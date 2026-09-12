@@ -64,9 +64,33 @@ static void test_enabled_access_without_session_fails_closed(void)
                     ==, MEMTX_ERROR);
 }
 
+static void test_gpf_configuration(void)
+{
+    CxlType3MemsimV2Config config = cxl_type3_memsim_v2_default_config();
+    Error *err = NULL;
+
+    g_assert_false(config.gpf);
+    config.gpf = true;
+    g_assert_false(cxl_type3_memsim_v2_validate(&config, &err));
+    g_assert_nonnull(err);
+    g_clear_pointer(&err, error_free);
+    config.enabled = true;
+    g_assert_true(cxl_type3_memsim_v2_validate(&config, &err));
+    g_assert_null(err);
+    g_assert_cmphex(cxl_type3_memsim_v2_gpf_duration(&config), ==, 0x060a);
+    config.timeout_ms = 75000;
+    g_assert_true(cxl_type3_memsim_v2_validate(&config, &err));
+    g_assert_cmphex(cxl_type3_memsim_v2_gpf_duration(&config), ==, 0x070f);
+    config.timeout_ms++;
+    g_assert_false(cxl_type3_memsim_v2_validate(&config, &err));
+    g_assert_nonnull(err);
+    error_free(err);
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
+    g_test_add_func("/cxl/type3/memsim-v2/gpf-config", test_gpf_configuration);
     g_test_add_func("/cxl/type3/memsim-v2/default-config",
                     test_default_config_is_disabled_and_valid);
     g_test_add_func("/cxl/type3/memsim-v2/invalid-host-id",
