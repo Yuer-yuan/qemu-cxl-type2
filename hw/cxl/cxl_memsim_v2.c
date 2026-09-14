@@ -1312,6 +1312,17 @@ static bool cxl_memsim_v2_load_policy(CxlMemsimV2Client *client,
         memcpy(bytes + copied, line->data + line_offset, chunk);
         qemu_mutex_unlock(&client->cache_lock);
         qemu_mutex_unlock(&client->state_lock);
+        /*
+         * A successful Phase 1 starts the CXL GPF access window.  Accesses
+         * admitted in that window must complete, but they must not recreate
+         * state that Phase 2 cannot make persistent.  Release even a clean
+         * hit before reporting completion to the caller.
+         */
+        if (client->gpf_phase1_done &&
+            !cxl_memsim_v2_cache_evict_address(client, line_address,
+                                                timeout_ms, errp)) {
+            goto out;
+        }
         cursor += chunk;
         copied += chunk;
     }
@@ -1371,7 +1382,8 @@ bool cxl_memsim_v2_store(CxlMemsimV2Client *client, uint64_t address, unsigned s
         line->dirty = true;
         qemu_mutex_unlock(&client->cache_lock);
         qemu_mutex_unlock(&client->state_lock);
-        if (client->write_policy == CXL_MEMSIM_V2_WRITE_THROUGH &&
+        if ((client->write_policy == CXL_MEMSIM_V2_WRITE_THROUGH ||
+             client->gpf_phase1_done) &&
             !cxl_memsim_v2_cache_evict_address(client, line_address, timeout_ms, errp)) {
             goto out;
         }
@@ -1572,10 +1584,13 @@ bool cxl_memsim_v2_gpf(CxlMemsimV2Client *client, unsigned phase,
         goto out;
     }
     if (phase == 1) {
-        client->gpf_frozen = true;
         if (!cxl_memsim_v2_drain_modified(client, timeout_ms, &visits, errp)) {
+            client->gpf_frozen = true;
             goto out;
         }
+    } else {
+        /* Phase 2 is the local admission cut for all subsequent accesses. */
+        client->gpf_frozen = true;
     }
     cxl_memsim_v2_frame_init(&request, phase == 1 ?
                             CXL_MEMSIM_V2_OP_GPF_PHASE1 :
@@ -1594,6 +1609,9 @@ bool cxl_memsim_v2_gpf(CxlMemsimV2Client *client, unsigned phase,
     }
     if (success && phase == 1) {
         client->gpf_phase1_done = true;
+    } else if (!success && phase == 1) {
+        /* An uncertain Phase 1 fails closed; only GPF retry remains usable. */
+        client->gpf_frozen = true;
     }
 out:
     qemu_mutex_unlock(&client->operation_lock);

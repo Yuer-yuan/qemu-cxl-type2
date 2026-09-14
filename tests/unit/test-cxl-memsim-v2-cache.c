@@ -344,6 +344,17 @@ static bool expect_putm(CachePeer *peer, uint8_t frame[CXL_MEMSIM_V2_FRAME_SIZE]
     return send_response(peer, frame, CXL_MEMSIM_V2_STATE_I, epoch, NULL, 0);
 }
 
+static bool expect_puts(CachePeer *peer, uint8_t frame[CXL_MEMSIM_V2_FRAME_SIZE],
+                        uint64_t address, uint64_t epoch)
+{
+    if (!expect_frame(peer, CXL_MEMSIM_V2_OP_PUTS, frame) ||
+        get_le64(frame, 48) != address || get_le16(frame, 20)) {
+        peer->error_code = EPROTO;
+        return false;
+    }
+    return send_response(peer, frame, CXL_MEMSIM_V2_STATE_I, epoch, NULL, 0);
+}
+
 static bool run_wb_retain_script(CachePeer *peer, uint8_t *frame) {
     uint8_t line[CXL_MEMSIM_V2_LINE_SIZE] = {0};
 
@@ -874,8 +885,20 @@ static bool run_gpf_script(CachePeer *peer, uint8_t *frame)
             return false;
         }
     }
-    if (!send_response(peer, frame, CXL_MEMSIM_V2_STATE_I, 0, NULL, 0) ||
-        !expect_frame(peer, CXL_MEMSIM_V2_OP_GPF_PHASE2, frame)) {
+    if (!send_response(peer, frame, CXL_MEMSIM_V2_STATE_I, 0, NULL, 0)) {
+        return false;
+    }
+    if (peer->script != CACHE_PEER_GPF_FAILURE) {
+        if (!expect_puts(peer, frame, TEST_LINE_A, 2) ||
+            !expect_frame(peer, CXL_MEMSIM_V2_OP_GETM, frame) ||
+            get_le64(frame, 48) != TEST_LINE_C ||
+            !send_response(peer, frame, CXL_MEMSIM_V2_STATE_M, 1,
+                           line, 0) ||
+            !expect_putm(peer, frame, TEST_LINE_C, TEST_VALUE_A, 2)) {
+            return false;
+        }
+    }
+    if (!expect_frame(peer, CXL_MEMSIM_V2_OP_GPF_PHASE2, frame)) {
         return false;
     }
     if (peer->script == CACHE_PEER_GPF_FAILURE) {
@@ -1517,7 +1540,16 @@ static void test_gpf(gconstpointer opaque)
     }
     g_assert_true(cxl_memsim_v2_gpf(client, 1, TEST_TIMEOUT_MS, &err));
     g_assert_null(err);
-    assert_gpf_frozen(client);
+    if (peer.script == CACHE_PEER_GPF_FAILURE) {
+        assert_gpf_frozen(client);
+    } else {
+        g_assert_true(cxl_memsim_v2_load(client, TEST_LINE_A, 8, &value,
+                                        TEST_TIMEOUT_MS, &err));
+        g_assert_true(cxl_memsim_v2_store(client, TEST_LINE_C, 8,
+                                         TEST_VALUE_A, TEST_TIMEOUT_MS,
+                                         &err));
+        g_assert_null(err);
+    }
     if (peer.script == CACHE_PEER_GPF_FAILURE) {
         g_assert_false(cxl_memsim_v2_gpf(client, 2, TEST_TIMEOUT_MS, &err));
         g_assert_nonnull(err);
@@ -1535,7 +1567,10 @@ static void test_gpf(gconstpointer opaque)
     }
     assert_gpf_frozen(client);
     finish_cache_test(&peer, peer_thread, client);
-    g_assert_cmpuint(peer.putm, ==, 1);
+    g_assert_cmpuint(peer.putm, ==,
+                     peer.script == CACHE_PEER_GPF_FAILURE ? 1 : 2);
+    g_assert_cmpuint(peer.puts, ==,
+                     peer.script == CACHE_PEER_GPF_FAILURE ? 0 : 1);
     g_assert_cmpuint(peer.fences, ==, 0);
     g_assert_false(peer.unregistered);
 }
