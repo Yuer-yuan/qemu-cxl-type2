@@ -21,6 +21,7 @@
 #include "qemu/log.h"
 #include "qemu/range.h"
 #include "hw/pci/pci_bridge.h"
+#include "hw/pci-bridge/cxl_root_port.h"
 #include "hw/pci/pcie_port.h"
 #include "hw/pci/msi.h"
 #include "hw/qdev-properties.h"
@@ -48,10 +49,60 @@ typedef struct CXLRootPort {
 
     CXLComponentState cxl_cstate;
     PCIResReserve res_reserve;
+    uint32_t gpf_phase1_timeout_ms;
+    uint32_t gpf_phase2_timeout_ms;
 } CXLRootPort;
 
-#define TYPE_CXL_ROOT_PORT "cxl-rp"
 DECLARE_INSTANCE_CHECKER(CXLRootPort, CXL_ROOT_PORT, TYPE_CXL_ROOT_PORT)
+
+static uint16_t cxl_rp_encode_gpf_timeout_ms(uint32_t timeout_ms)
+{
+    uint64_t duration_us = (uint64_t)timeout_ms * 1000;
+    unsigned scale = 0;
+
+    while (duration_us > 15 && scale < 15) {
+        duration_us = DIV_ROUND_UP(duration_us, 10);
+        scale++;
+    }
+    return (scale << 8) | duration_us;
+}
+
+static uint32_t cxl_rp_decode_gpf_timeout_ms(uint16_t control)
+{
+    uint64_t duration_us = control & 0xf;
+    unsigned scale = (control >> 8) & 0xf;
+
+    while (scale-- && duration_us <= UINT64_MAX / 10) {
+        duration_us *= 10;
+    }
+    return MIN(DIV_ROUND_UP(duration_us, 1000), UINT32_MAX);
+}
+
+bool cxl_rp_get_gpf_timeout_ms(PCIDevice *device, unsigned phase,
+                               uint32_t *timeout_ms, Error **errp)
+{
+    CXLRootPort *crp;
+    uint16_t offset;
+    uint16_t control;
+
+    if (!device || !timeout_ms || (phase != 1 && phase != 2) ||
+        !object_dynamic_cast(OBJECT(device), TYPE_CXL_ROOT_PORT)) {
+        error_setg(errp, "CXL GPF endpoint must be below a CXL Root Port");
+        return false;
+    }
+    crp = CXL_ROOT_PORT(device);
+    offset = crp->cxl_cstate.dvsecs[GPF_PORT_DVSEC].lob;
+    control = pci_get_word(device->config + offset +
+        (phase == 1 ? offsetof(CXLDVSECPortGPF, phase1_ctrl) :
+                      offsetof(CXLDVSECPortGPF, phase2_ctrl)));
+    *timeout_ms = cxl_rp_decode_gpf_timeout_ms(control);
+    if (!*timeout_ms) {
+        error_setg(errp, "CXL Root Port GPF Phase %u timeout is disabled",
+                   phase);
+        return false;
+    }
+    return true;
+}
 
 /*
  * If two MSI vector are allocated, Advanced Error Interrupt Message Number
@@ -104,8 +155,9 @@ static void latch_registers(CXLRootPort *crp)
     cxl_component_register_init_common(reg_state, write_msk, CXL2_ROOT_PORT, true);
 }
 
-static void build_dvsecs(CXLComponentState *cxl)
+static void build_dvsecs(CXLRootPort *crp)
 {
+    CXLComponentState *cxl = &crp->cxl_cstate;
     uint8_t *dvsec;
 
     dvsec = (uint8_t *)&(CXLDVSECPortExt){ 0 };
@@ -116,8 +168,10 @@ static void build_dvsecs(CXLComponentState *cxl)
 
     dvsec = (uint8_t *)&(CXLDVSECPortGPF){
         .rsvd        = 0,
-        .phase1_ctrl = 1, /* 1μs timeout */
-        .phase2_ctrl = 1, /* 1μs timeout */
+        .phase1_ctrl = cxl_rp_encode_gpf_timeout_ms(
+            crp->gpf_phase1_timeout_ms),
+        .phase2_ctrl = cxl_rp_encode_gpf_timeout_ms(
+            crp->gpf_phase2_timeout_ms),
     };
     cxl_component_create_dvsec(cxl, CXL2_ROOT_PORT,
                                GPF_PORT_DVSEC_LENGTH, GPF_PORT_DVSEC,
@@ -154,6 +208,14 @@ static void cxl_rp_realize(DeviceState *dev, Error **errp)
     MemoryRegion *component_bar = &cregs->component_registers;
     Error *local_err = NULL;
 
+    if (!crp->gpf_phase1_timeout_ms || !crp->gpf_phase2_timeout_ms ||
+        crp->gpf_phase1_timeout_ms > 150000 ||
+        crp->gpf_phase2_timeout_ms > 150000) {
+        error_setg(errp, "CXL Root Port GPF timeouts must be between 1 and "
+                   "150000 ms");
+        return;
+    }
+
     rpc->parent_realize(dev, &local_err);
     if (local_err) {
         error_propagate(errp, local_err);
@@ -176,7 +238,7 @@ static void cxl_rp_realize(DeviceState *dev, Error **errp)
 
     cxl_cstate->dvsec_offset = CXL_ROOT_PORT_DVSEC_OFFSET;
     cxl_cstate->pdev = pci_dev;
-    build_dvsecs(cxl_cstate);
+    build_dvsecs(crp);
 
     cxl_component_register_block_init(OBJECT(pci_dev), cxl_cstate,
                                       TYPE_CXL_ROOT_PORT);
@@ -212,6 +274,10 @@ static const Property gen_rp_props[] = {
     DEFINE_PROP_PCIE_LINK_WIDTH("x-width", PCIESlot,
                                 width, PCIE_LINK_WIDTH_32),
     DEFINE_PROP_BOOL("x-256b-flit", PCIESlot, flitmode, false),
+    DEFINE_PROP_UINT32("x-gpf-phase1-timeout-ms", CXLRootPort,
+                       gpf_phase1_timeout_ms, 150000),
+    DEFINE_PROP_UINT32("x-gpf-phase2-timeout-ms", CXLRootPort,
+                       gpf_phase2_timeout_ms, 10000),
 };
 
 static void cxl_rp_dvsec_write_config(PCIDevice *dev, uint32_t addr,

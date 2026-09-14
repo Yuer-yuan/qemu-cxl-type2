@@ -469,6 +469,8 @@ static void test_gpf_dvsec_attributes(void)
     qtest_writeb(qts, port + PCI_SECONDARY_BUS, 65);
     qtest_writeb(qts, port + PCI_SUBORDINATE_BUS, 65);
     offset = find_gpf_dvsec(qts, port, 4);
+    g_assert_cmphex(qtest_readw(qts, port + offset + 12), ==, 0x070f);
+    g_assert_cmphex(qtest_readw(qts, port + offset + 14), ==, 0x060a);
     qtest_writel(qts, port + offset + 12, 0xffffffff);
     g_assert_cmphex(qtest_readl(qts, port + offset + 12), ==, 0x0f0f0f0f);
     qtest_writew(qts, port + offset + 12, 0x0702);

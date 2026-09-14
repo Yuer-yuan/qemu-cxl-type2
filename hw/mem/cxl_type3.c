@@ -17,6 +17,8 @@
 #include "hw/mem/memory-device.h"
 #include "hw/mem/pc-dimm.h"
 #include "hw/pci/pci.h"
+#include "hw/pci/pci_bridge.h"
+#include "hw/pci-bridge/cxl_root_port.h"
 #include "hw/qdev-properties.h"
 #include "hw/qdev-properties-system.h"
 #include "qapi/error.h"
@@ -2899,6 +2901,9 @@ void qmp_x_cxl_gpf(const char *path, uint8_t phase, Error **errp)
 {
     Object *obj = object_resolve_path(path, NULL);
     CXLType3Dev *ct3d;
+    PCIDevice *root_port;
+    uint32_t port_timeout_ms;
+    uint32_t device_duration_ms;
 
     if (!obj || !object_dynamic_cast(obj, TYPE_CXL_TYPE3)) {
         error_setg(errp, "GPF path must resolve to a CXL Type-3 device");
@@ -2909,7 +2914,24 @@ void qmp_x_cxl_gpf(const char *path, uint8_t phase, Error **errp)
         return;
     }
     ct3d = CXL_TYPE3(obj);
-    cxl_type3_memsim_v2_gpf(&ct3d->memsim_v2, phase, errp);
+    if (!ct3d->memsim_v2.config.gpf) {
+        error_setg(errp, "CXL Type-3 GPF functional model is not enabled");
+        return;
+    }
+    root_port = pci_bridge_get_device(pci_get_bus(PCI_DEVICE(ct3d)));
+    if (!cxl_rp_get_gpf_timeout_ms(root_port, phase, &port_timeout_ms,
+                                   errp)) {
+        return;
+    }
+    device_duration_ms = 2 * ct3d->memsim_v2.config.timeout_ms;
+    if (phase == 2 && port_timeout_ms < device_duration_ms) {
+        error_setg(errp, "CXL Root Port Phase 2 timeout (%u ms) is shorter "
+                   "than the device GPF duration (%u ms)",
+                   port_timeout_ms, device_duration_ms);
+        return;
+    }
+    cxl_type3_memsim_v2_gpf(&ct3d->memsim_v2, phase, port_timeout_ms,
+                             errp);
 }
 
 void qmp_cxl_inject_poison(const char *path, uint64_t start, uint64_t length,

@@ -1490,9 +1490,27 @@ bool cxl_memsim_v2_compare_exchange(CxlMemsimV2Client *client, uint64_t address,
                                 timeout_ms, errp);
 }
 
+static int cxl_memsim_v2_deadline_request_timeout(int request_timeout_ms,
+                                                  int64_t deadline_us,
+                                                  Error **errp)
+{
+    int64_t remaining_us = deadline_us - g_get_monotonic_time();
+    uint64_t one_attempt_ms;
+
+    if (remaining_us <= 0) {
+        error_setg(errp, "CXLMemSim v2 GPF timed out at the port deadline");
+        return 0;
+    }
+    /* transact_internal can make two attempts with the same request ID. */
+    one_attempt_ms = MAX(1, remaining_us / (2 * G_TIME_SPAN_MILLISECOND));
+    return MIN((uint64_t)request_timeout_ms,
+               MIN(one_attempt_ms, (uint64_t)INT_MAX));
+}
+
 static bool cxl_memsim_v2_drain_modified(CxlMemsimV2Client *client,
-                                        int timeout_ms, uint64_t *visits,
-                                        Error **errp)
+                                        int request_timeout_ms,
+                                        int64_t deadline_us,
+                                        uint64_t *visits, Error **errp)
 {
     /*
      * Local additions/replacements are excluded by operation_lock. Snoops
@@ -1515,7 +1533,14 @@ static bool cxl_memsim_v2_drain_modified(CxlMemsimV2Client *client,
         client->fence_cache_visits++;
         (*visits)++;
         qemu_mutex_unlock(&client->cache_lock);
-        if (!cxl_memsim_v2_cache_evict_address(client, dirty_address, timeout_ms, errp)) {
+        int timeout_ms = deadline_us ?
+            cxl_memsim_v2_deadline_request_timeout(request_timeout_ms,
+                                                   deadline_us, errp) :
+            request_timeout_ms;
+
+        if (!timeout_ms ||
+            !cxl_memsim_v2_cache_evict_address(client, dirty_address,
+                                                timeout_ms, errp)) {
             return false;
         }
     }
@@ -1540,7 +1565,8 @@ bool cxl_memsim_v2_fence(CxlMemsimV2Client *client, int timeout_ms,
     qemu_mutex_lock(&client->operation_lock);
     acquired = g_get_monotonic_time();
     if (!cxl_memsim_v2_access_allowed(client, errp) ||
-        !cxl_memsim_v2_drain_modified(client, timeout_ms, &visits, errp)) {
+        !cxl_memsim_v2_drain_modified(client, timeout_ms, 0, &visits,
+                                      errp)) {
         goto out;
     }
     released = g_get_monotonic_time();
@@ -1566,15 +1592,19 @@ out:
 }
 
 bool cxl_memsim_v2_gpf(CxlMemsimV2Client *client, unsigned phase,
-                       int timeout_ms, Error **errp)
+                       int request_timeout_ms, int total_timeout_ms,
+                       Error **errp)
 {
     CxlMemsimV2Frame request;
     CxlMemsimV2Frame response;
     uint64_t visits = 0;
     bool success = false;
+    int64_t deadline_us = g_get_monotonic_time() +
+                          total_timeout_ms * G_TIME_SPAN_MILLISECOND;
+    int timeout_ms;
 
     if (!client || !client->gpf_enabled || (phase != 1 && phase != 2) ||
-        timeout_ms <= 0) {
+        request_timeout_ms <= 0 || total_timeout_ms <= 0) {
         error_setg(errp, "invalid or disabled CXLMemSim v2 GPF request");
         return false;
     }
@@ -1584,13 +1614,19 @@ bool cxl_memsim_v2_gpf(CxlMemsimV2Client *client, unsigned phase,
         goto out;
     }
     if (phase == 1) {
-        if (!cxl_memsim_v2_drain_modified(client, timeout_ms, &visits, errp)) {
+        if (!cxl_memsim_v2_drain_modified(client, request_timeout_ms,
+                                          deadline_us, &visits, errp)) {
             client->gpf_frozen = true;
             goto out;
         }
     } else {
         /* Phase 2 is the local admission cut for all subsequent accesses. */
         client->gpf_frozen = true;
+    }
+    timeout_ms = cxl_memsim_v2_deadline_request_timeout(
+        request_timeout_ms, deadline_us, errp);
+    if (!timeout_ms) {
+        goto out;
     }
     cxl_memsim_v2_frame_init(&request, phase == 1 ?
                             CXL_MEMSIM_V2_OP_GPF_PHASE1 :

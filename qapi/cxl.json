@@ -12,9 +12,11 @@
 #
 # Execute a phase of the CXLMemSim Type 3 Global Persistent Flush model.
 # The VM must be stopped and the endpoint must have x-gpf enabled. Phase 1
-# freezes local accesses and drains dirty cache lines. Complete Phase 1 on
-# every endpoint sharing the server before requesting Phase 2, which flushes
-# the persistent backing file. Endpoints remain frozen until process restart.
+# drains dirty cache lines and opens a bounded access window in which each
+# access releases its grant before completion. Complete Phase 1 on every
+# endpoint sharing the server before requesting Phase 2, which closes that
+# window and flushes the persistent backing file. Endpoints remain frozen
+# after Phase 2 until process restart.
 # This experimental command models the persistence handoff, not PCIe PM VDM
 # packets, power budgets or physical media power-loss protection.
 #

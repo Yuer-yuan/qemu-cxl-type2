@@ -413,7 +413,7 @@ MemTxResult cxl_type3_memsim_v2_persist(CxlType3MemsimV2 *state)
 }
 
 bool cxl_type3_memsim_v2_gpf(CxlType3MemsimV2 *state, unsigned phase,
-                             Error **errp)
+                             uint32_t total_timeout_ms, Error **errp)
 {
     Error *local_err = NULL;
     bool success;
@@ -423,7 +423,8 @@ bool cxl_type3_memsim_v2_gpf(CxlType3MemsimV2 *state, unsigned phase,
         return false;
     }
     success = cxl_memsim_v2_gpf(state->client, phase,
-                                state->config.timeout_ms, &local_err);
+                                state->config.timeout_ms,
+                                MIN(total_timeout_ms, INT_MAX), &local_err);
     if (!success) {
         Error *state_err = NULL;
 

@@ -1524,7 +1524,8 @@ static void test_gpf(gconstpointer opaque)
     Error *err = NULL;
     uint64_t value;
 
-    g_assert_false(cxl_memsim_v2_gpf(client, 2, TEST_TIMEOUT_MS, &err));
+    g_assert_false(cxl_memsim_v2_gpf(client, 2, TEST_TIMEOUT_MS,
+                                     2 * TEST_TIMEOUT_MS, &err));
     g_assert_nonnull(err);
     g_clear_pointer(&err, error_free);
     g_assert_true(cxl_memsim_v2_load(client, TEST_LINE_A, 8, &value,
@@ -1533,12 +1534,14 @@ static void test_gpf(gconstpointer opaque)
                                      TEST_TIMEOUT_MS, &err));
     g_assert_null(err);
     if (peer.script == CACHE_PEER_GPF_FAILURE) {
-        g_assert_false(cxl_memsim_v2_gpf(client, 1, TEST_TIMEOUT_MS, &err));
+        g_assert_false(cxl_memsim_v2_gpf(client, 1, TEST_TIMEOUT_MS,
+                                         2 * TEST_TIMEOUT_MS, &err));
         g_assert_nonnull(err);
         g_clear_pointer(&err, error_free);
         assert_gpf_frozen(client);
     }
-    g_assert_true(cxl_memsim_v2_gpf(client, 1, TEST_TIMEOUT_MS, &err));
+    g_assert_true(cxl_memsim_v2_gpf(client, 1, TEST_TIMEOUT_MS,
+                                    2 * TEST_TIMEOUT_MS, &err));
     g_assert_null(err);
     if (peer.script == CACHE_PEER_GPF_FAILURE) {
         assert_gpf_frozen(client);
@@ -1551,18 +1554,20 @@ static void test_gpf(gconstpointer opaque)
         g_assert_null(err);
     }
     if (peer.script == CACHE_PEER_GPF_FAILURE) {
-        g_assert_false(cxl_memsim_v2_gpf(client, 2, TEST_TIMEOUT_MS, &err));
+        g_assert_false(cxl_memsim_v2_gpf(client, 2, TEST_TIMEOUT_MS,
+                                         2 * TEST_TIMEOUT_MS, &err));
         g_assert_nonnull(err);
         g_clear_pointer(&err, error_free);
         assert_gpf_frozen(client);
     }
     if (peer.script == CACHE_PEER_GPF_TIMEOUT) {
-        g_assert_false(cxl_memsim_v2_gpf(client, 2, 50, &err));
+        g_assert_false(cxl_memsim_v2_gpf(client, 2, 50, 100, &err));
         g_assert_nonnull(err);
         g_assert_nonnull(strstr(error_get_pretty(err), "timed out"));
         g_clear_pointer(&err, error_free);
     } else {
-        g_assert_true(cxl_memsim_v2_gpf(client, 2, TEST_TIMEOUT_MS, &err));
+        g_assert_true(cxl_memsim_v2_gpf(client, 2, TEST_TIMEOUT_MS,
+                                        2 * TEST_TIMEOUT_MS, &err));
         g_assert_null(err);
     }
     assert_gpf_frozen(client);

@@ -49,7 +49,7 @@ MemTxResult cxl_type3_memsim_v2_cache_block(CxlType3MemsimV2 *state,
                                             uint64_t dpa);
 MemTxResult cxl_type3_memsim_v2_persist(CxlType3MemsimV2 *state);
 bool cxl_type3_memsim_v2_gpf(CxlType3MemsimV2 *state, unsigned phase,
-                             Error **errp);
+                             uint32_t total_timeout_ms, Error **errp);
 uint16_t cxl_type3_memsim_v2_gpf_duration(const CxlType3MemsimV2Config *config);
 bool cxl_type3_memsim_v2_init_shutdown_state(CxlType3MemsimV2 *state,
                                              Error **errp);

@@ -186,7 +186,8 @@ bool cxl_memsim_v2_fence(CxlMemsimV2Client *client, int timeout_ms,
                          Error **errp);
 /* Phase 1 freezes ordinary accesses until process restart, even on failure. */
 bool cxl_memsim_v2_gpf(CxlMemsimV2Client *client, unsigned phase,
-                       int timeout_ms, Error **errp);
+                       int request_timeout_ms, int total_timeout_ms,
+                       Error **errp);
 
 uint16_t cxl_memsim_v2_client_endpoint(CxlMemsimV2Client *client);
 uint64_t cxl_memsim_v2_client_session(CxlMemsimV2Client *client);
