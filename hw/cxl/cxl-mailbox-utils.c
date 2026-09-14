@@ -94,8 +94,11 @@ enum {
         #define GET_LSA       0x2
         #define SET_LSA       0x3
     HEALTH_INFO_ALERTS = 0x42,
+        #define GET_HEALTH_INFO 0x0
         #define GET_ALERT_CONFIG 0x1
         #define SET_ALERT_CONFIG 0x2
+        #define GET_SHUTDOWN_STATE 0x3
+        #define SET_SHUTDOWN_STATE 0x4
     SANITIZE    = 0x44,
         #define OVERWRITE     0x0
         #define SECURE_ERASE  0x1
@@ -1775,6 +1778,74 @@ static CXLRetCode cmd_ccls_set_lsa(const struct cxl_cmd *cmd,
     len_in -= hdr_len;
 
     cvc->set_lsa(ct3d, set_lsa_payload->data, len_in, set_lsa_payload->offset);
+    return CXL_MBOX_SUCCESS;
+}
+
+/* CXL r3.2 Section 8.2.10.9.3.1 Get Health Info (Opcode 4200h) */
+static CXLRetCode cmd_get_health_info(const struct cxl_cmd *cmd,
+                                      uint8_t *payload_in,
+                                      size_t len_in,
+                                      uint8_t *payload_out,
+                                      size_t *len_out,
+                                      CXLCCI *cci)
+{
+    CXLType3Dev *ct3d = CXL_TYPE3(cci->d);
+    struct {
+        uint8_t health_status;
+        uint8_t media_status;
+        uint8_t additional_status;
+        uint8_t life_used;
+        uint16_t device_temperature;
+        uint32_t dirty_shutdown_count;
+        uint32_t corrected_volatile_error_count;
+        uint32_t corrected_persistent_error_count;
+    } QEMU_PACKED *out = (void *)payload_out;
+
+    QEMU_BUILD_BUG_ON(sizeof(*out) != 18);
+    memset(out, 0, sizeof(*out));
+    stl_le_p(&out->dirty_shutdown_count,
+             cxl_type3_memsim_v2_dirty_shutdown_count(&ct3d->memsim_v2));
+    *len_out = sizeof(*out);
+    return CXL_MBOX_SUCCESS;
+}
+
+/* CXL r3.2 Section 8.2.10.9.3.4 Get Shutdown State (Opcode 4203h) */
+static CXLRetCode cmd_get_shutdown_state(const struct cxl_cmd *cmd,
+                                         uint8_t *payload_in,
+                                         size_t len_in,
+                                         uint8_t *payload_out,
+                                         size_t *len_out,
+                                         CXLCCI *cci)
+{
+    CXLType3Dev *ct3d = CXL_TYPE3(cci->d);
+
+    payload_out[0] =
+        cxl_type3_memsim_v2_get_shutdown_state(&ct3d->memsim_v2);
+    *len_out = 1;
+    return CXL_MBOX_SUCCESS;
+}
+
+/* CXL r3.2 Section 8.2.10.9.3.5 Set Shutdown State (Opcode 4204h) */
+static CXLRetCode cmd_set_shutdown_state(const struct cxl_cmd *cmd,
+                                         uint8_t *payload_in,
+                                         size_t len_in,
+                                         uint8_t *payload_out,
+                                         size_t *len_out,
+                                         CXLCCI *cci)
+{
+    CXLType3Dev *ct3d = CXL_TYPE3(cci->d);
+    Error *local_err = NULL;
+
+    if (payload_in[0] > 1) {
+        return CXL_MBOX_INVALID_INPUT;
+    }
+    if (!cxl_type3_memsim_v2_set_shutdown_state(&ct3d->memsim_v2,
+                                                 payload_in[0],
+                                                 &local_err)) {
+        error_report_err(local_err);
+        return CXL_MBOX_INTERNAL_ERROR;
+    }
+    *len_out = 0;
     return CXL_MBOX_SUCCESS;
 }
 
@@ -3983,12 +4054,21 @@ static const struct cxl_cmd cxl_cmd_set[256][256] = {
     [CCLS][GET_LSA] = { "CCLS_GET_LSA", cmd_ccls_get_lsa, 8, 0 },
     [CCLS][SET_LSA] = { "CCLS_SET_LSA", cmd_ccls_set_lsa,
         ~0, CXL_MBOX_IMMEDIATE_CONFIG_CHANGE | CXL_MBOX_IMMEDIATE_DATA_CHANGE },
+    [HEALTH_INFO_ALERTS][GET_HEALTH_INFO] = {
+        "HEALTH_INFO_ALERTS_GET_HEALTH_INFO",
+        cmd_get_health_info, 0, 0 },
     [HEALTH_INFO_ALERTS][GET_ALERT_CONFIG] = {
         "HEALTH_INFO_ALERTS_GET_ALERT_CONFIG",
         cmd_get_alert_config, 0, 0 },
     [HEALTH_INFO_ALERTS][SET_ALERT_CONFIG] = {
         "HEALTH_INFO_ALERTS_SET_ALERT_CONFIG",
         cmd_set_alert_config, 12, CXL_MBOX_IMMEDIATE_POLICY_CHANGE },
+    [HEALTH_INFO_ALERTS][GET_SHUTDOWN_STATE] = {
+        "HEALTH_INFO_ALERTS_GET_SHUTDOWN_STATE",
+        cmd_get_shutdown_state, 0, 0 },
+    [HEALTH_INFO_ALERTS][SET_SHUTDOWN_STATE] = {
+        "HEALTH_INFO_ALERTS_SET_SHUTDOWN_STATE",
+        cmd_set_shutdown_state, 1, CXL_MBOX_IMMEDIATE_POLICY_CHANGE },
     [SANITIZE][OVERWRITE] = { "SANITIZE_OVERWRITE", cmd_sanitize_overwrite, 0,
         (CXL_MBOX_IMMEDIATE_DATA_CHANGE |
          CXL_MBOX_SECURITY_STATE_CHANGE |

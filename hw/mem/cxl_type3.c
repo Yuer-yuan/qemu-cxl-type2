@@ -906,6 +906,8 @@ static void ct3_realize(PCIDevice *pci_dev, Error **errp)
     }
     ct3d->memsim_v2.config.server_host = ct3d->memsim_v2_server_host ?
         ct3d->memsim_v2_server_host : "127.0.0.1";
+    ct3d->memsim_v2.config.gpf_state_file =
+        ct3d->memsim_v2_gpf_state_file;
     if (!cxl_type3_memsim_v2_validate(&ct3d->memsim_v2.config, errp)) {
         return;
     }
@@ -2694,6 +2696,8 @@ static const Property ct3_props[] = {
     DEFINE_PROP_BOOL("coherence-v2", CXLType3Dev,
                      memsim_v2.config.enabled, false),
     DEFINE_PROP_BOOL("x-gpf", CXLType3Dev, memsim_v2.config.gpf, false),
+    DEFINE_PROP_STRING("x-gpf-state-file", CXLType3Dev,
+                       memsim_v2_gpf_state_file),
     DEFINE_PROP_STRING("cxlmemsim-addr", CXLType3Dev,
                        memsim_v2_server_host),
     DEFINE_PROP_UINT16("cxlmemsim-port", CXLType3Dev,

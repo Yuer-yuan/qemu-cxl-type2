@@ -591,6 +591,7 @@ struct CXLType3Dev {
     HostMemoryBackend *lsa;
     uint64_t sn;
     char *memsim_v2_server_host;
+    char *memsim_v2_gpf_state_file;
     CxlType3MemsimV2 memsim_v2;
 
     /* State */

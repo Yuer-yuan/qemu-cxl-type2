@@ -7,6 +7,8 @@
 #include "qemu/osdep.h"
 
 #include "hw/cxl/cxl_type3_memsim_v2.h"
+#include "qemu/bswap.h"
+#include "qemu/crc32c.h"
 #include "qemu/error-report.h"
 #include "qemu/units.h"
 
@@ -14,6 +16,210 @@
 #define CXL_TYPE3_MEMSIM_V2_DEFAULT_CACHE_CAPACITY (256 * KiB)
 #define CXL_TYPE3_MEMSIM_V2_DEFAULT_CACHE_WAYS 4
 #define CXL_TYPE3_MEMSIM_V2_DEFAULT_TIMEOUT_MS 5000
+
+#define CXL_TYPE3_GPF_STATE_MAGIC UINT32_C(0x31504647) /* "GPF1" */
+#define CXL_TYPE3_GPF_STATE_VERSION 1
+#define CXL_TYPE3_SHUTDOWN_CLEAN 0
+#define CXL_TYPE3_SHUTDOWN_DIRTY 1
+
+typedef struct CxlType3GpfStateRecord {
+    uint32_t magic;
+    uint16_t version;
+    uint8_t shutdown_state;
+    uint8_t reserved;
+    uint32_t dirty_shutdown_count;
+    uint32_t checksum;
+} QEMU_PACKED CxlType3GpfStateRecord;
+
+QEMU_BUILD_BUG_ON(sizeof(CxlType3GpfStateRecord) != 16);
+
+static ssize_t cxl_type3_gpf_read_full(int fd, void *buffer, size_t length)
+{
+    size_t offset = 0;
+
+    while (offset < length) {
+        ssize_t bytes = read(fd, (uint8_t *)buffer + offset,
+                             length - offset);
+
+        if (bytes > 0) {
+            offset += bytes;
+        } else if (!bytes) {
+            break;
+        } else if (errno != EINTR) {
+            return -1;
+        }
+    }
+    return offset;
+}
+
+static uint32_t cxl_type3_gpf_state_checksum(CxlType3GpfStateRecord record)
+{
+    record.checksum = 0;
+    return crc32c(UINT32_MAX, (const uint8_t *)&record, sizeof(record));
+}
+
+static bool cxl_type3_gpf_state_store(CxlType3MemsimV2 *state,
+                                      uint8_t shutdown_state,
+                                      uint32_t dirty_shutdown_count,
+                                      Error **errp)
+{
+    const char *path = state->config.gpf_state_file;
+    g_autofree char *temporary = g_strdup_printf("%s.tmp.XXXXXX", path);
+    g_autofree char *directory = g_path_get_dirname(path);
+    CxlType3GpfStateRecord record = {
+        .magic = cpu_to_le32(CXL_TYPE3_GPF_STATE_MAGIC),
+        .version = cpu_to_le16(CXL_TYPE3_GPF_STATE_VERSION),
+        .shutdown_state = shutdown_state,
+        .dirty_shutdown_count = cpu_to_le32(dirty_shutdown_count),
+    };
+    int fd = -1;
+    int directory_fd = -1;
+    bool success = false;
+
+    record.checksum = cpu_to_le32(cxl_type3_gpf_state_checksum(record));
+    fd = g_mkstemp_full(temporary, O_RDWR | O_CLOEXEC, 0600);
+    if (fd < 0) {
+        error_setg_errno(errp, errno, "cannot create GPF state file '%s'",
+                         temporary);
+        goto out;
+    }
+    if (qemu_write_full(fd, &record, sizeof(record)) != sizeof(record) ||
+        qemu_fdatasync(fd) < 0) {
+        error_setg_errno(errp, errno, "cannot persist GPF state file '%s'",
+                         temporary);
+        goto out;
+    }
+    if (close(fd) < 0) {
+        fd = -1;
+        error_setg_errno(errp, errno, "cannot close GPF state file '%s'",
+                         temporary);
+        goto out;
+    }
+    fd = -1;
+    if (rename(temporary, path) < 0) {
+        error_setg_errno(errp, errno, "cannot replace GPF state file '%s'",
+                         path);
+        goto out;
+    }
+    directory_fd = open(directory, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (directory_fd < 0 || fsync(directory_fd) < 0) {
+        error_setg_errno(errp, errno,
+                         "cannot persist GPF state directory '%s'",
+                         directory);
+        goto out;
+    }
+    state->shutdown_state = shutdown_state;
+    state->dirty_shutdown_count = dirty_shutdown_count;
+    success = true;
+out:
+    if (directory_fd >= 0) {
+        close(directory_fd);
+    }
+    if (fd >= 0) {
+        close(fd);
+    }
+    if (!success) {
+        unlink(temporary);
+    }
+    return success;
+}
+
+bool cxl_type3_memsim_v2_init_shutdown_state(CxlType3MemsimV2 *state,
+                                             Error **errp)
+{
+    CxlType3GpfStateRecord record;
+    uint32_t count = 0;
+    uint8_t shutdown_state = CXL_TYPE3_SHUTDOWN_CLEAN;
+    uint8_t extra;
+    int fd;
+
+    if (!state) {
+        error_setg(errp, "missing CXL Type-3 GPF state");
+        return false;
+    }
+    if (!state->config.gpf) {
+        state->shutdown_state_loaded = true;
+        state->shutdown_state = CXL_TYPE3_SHUTDOWN_CLEAN;
+        state->dirty_shutdown_count = 0;
+        return true;
+    }
+    if (!state->config.gpf_state_file || !state->config.gpf_state_file[0]) {
+        error_setg(errp, "CXL Type-3 x-gpf requires x-gpf-state-file");
+        return false;
+    }
+    fd = open(state->config.gpf_state_file, O_RDONLY | O_CLOEXEC);
+    if (fd < 0 && errno == ENOENT) {
+        if (!cxl_type3_gpf_state_store(state, shutdown_state, count, errp)) {
+            return false;
+        }
+        state->shutdown_state_loaded = true;
+        return true;
+    }
+    if (fd < 0) {
+        error_setg_errno(errp, errno, "cannot open GPF state file '%s'",
+                         state->config.gpf_state_file);
+        return false;
+    }
+    if (cxl_type3_gpf_read_full(fd, &record, sizeof(record)) !=
+            sizeof(record) ||
+        cxl_type3_gpf_read_full(fd, &extra, 1) != 0) {
+        error_setg(errp, "invalid length for GPF state file '%s'",
+                   state->config.gpf_state_file);
+        close(fd);
+        return false;
+    }
+    close(fd);
+    if (le32_to_cpu(record.magic) != CXL_TYPE3_GPF_STATE_MAGIC ||
+        le16_to_cpu(record.version) != CXL_TYPE3_GPF_STATE_VERSION ||
+        record.reserved || record.shutdown_state > CXL_TYPE3_SHUTDOWN_DIRTY ||
+        le32_to_cpu(record.checksum) !=
+            cxl_type3_gpf_state_checksum(record)) {
+        error_setg(errp, "corrupt GPF state file '%s'",
+                   state->config.gpf_state_file);
+        return false;
+    }
+    shutdown_state = record.shutdown_state;
+    count = le32_to_cpu(record.dirty_shutdown_count);
+    if (shutdown_state == CXL_TYPE3_SHUTDOWN_DIRTY && count != UINT32_MAX) {
+        count++;
+    }
+    if (!cxl_type3_gpf_state_store(state, shutdown_state, count, errp)) {
+        return false;
+    }
+    state->shutdown_state_loaded = true;
+    return true;
+}
+
+bool cxl_type3_memsim_v2_set_shutdown_state(CxlType3MemsimV2 *state,
+                                            uint8_t value, Error **errp)
+{
+    if (!state || !state->shutdown_state_loaded ||
+        value > CXL_TYPE3_SHUTDOWN_DIRTY) {
+        error_setg(errp, "invalid CXL Type-3 shutdown state");
+        return false;
+    }
+    if (!state->config.gpf) {
+        state->shutdown_state = value;
+        return true;
+    }
+    if (state->shutdown_state == value) {
+        return true;
+    }
+    return cxl_type3_gpf_state_store(state, value,
+                                     state->dirty_shutdown_count, errp);
+}
+
+uint8_t cxl_type3_memsim_v2_get_shutdown_state(
+    const CxlType3MemsimV2 *state)
+{
+    return state ? state->shutdown_state : CXL_TYPE3_SHUTDOWN_DIRTY;
+}
+
+uint32_t cxl_type3_memsim_v2_dirty_shutdown_count(
+    const CxlType3MemsimV2 *state)
+{
+    return state ? state->dirty_shutdown_count : UINT32_MAX;
+}
 
 CxlType3MemsimV2Config cxl_type3_memsim_v2_default_config(void)
 {
@@ -37,6 +243,11 @@ bool cxl_type3_memsim_v2_validate(const CxlType3MemsimV2Config *config,
     }
     if (config->gpf && !config->enabled) {
         error_setg(errp, "CXL Type-3 x-gpf requires coherence-v2");
+        return false;
+    }
+    if (config->gpf &&
+        (!config->gpf_state_file || !config->gpf_state_file[0])) {
+        error_setg(errp, "CXL Type-3 x-gpf requires x-gpf-state-file");
         return false;
     }
     if (config->gpf && config->timeout_ms > 75000) {
@@ -91,6 +302,9 @@ bool cxl_type3_memsim_v2_realize(CxlType3MemsimV2 *state, Error **errp)
         return false;
     }
     state->enabled = state->config.enabled;
+    if (!cxl_type3_memsim_v2_init_shutdown_state(state, errp)) {
+        return false;
+    }
     if (!state->enabled) {
         return true;
     }
@@ -201,12 +415,31 @@ MemTxResult cxl_type3_memsim_v2_persist(CxlType3MemsimV2 *state)
 bool cxl_type3_memsim_v2_gpf(CxlType3MemsimV2 *state, unsigned phase,
                              Error **errp)
 {
+    Error *local_err = NULL;
+    bool success;
+
     if (!state || !state->enabled || !state->client || !state->config.gpf) {
         error_setg(errp, "CXL Type-3 GPF functional model is not enabled");
         return false;
     }
-    return cxl_memsim_v2_gpf(state->client, phase,
-                             state->config.timeout_ms, errp);
+    success = cxl_memsim_v2_gpf(state->client, phase,
+                                state->config.timeout_ms, &local_err);
+    if (!success) {
+        Error *state_err = NULL;
+
+        if (!cxl_type3_memsim_v2_set_shutdown_state(
+                state, CXL_TYPE3_SHUTDOWN_DIRTY, &state_err)) {
+            error_report_err(state_err);
+        }
+        error_propagate(errp, local_err);
+        return false;
+    }
+    if (phase == 2 && !cxl_type3_memsim_v2_set_shutdown_state(
+            state, CXL_TYPE3_SHUTDOWN_CLEAN, &local_err)) {
+        error_propagate(errp, local_err);
+        return false;
+    }
+    return true;
 }
 
 uint16_t cxl_type3_memsim_v2_gpf_duration(const CxlType3MemsimV2Config *config)

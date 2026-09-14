@@ -22,12 +22,16 @@ typedef struct CxlType3MemsimV2Config {
     bool write_through;
     bool read_exclusive;
     bool gpf;
+    const char *gpf_state_file;
 } CxlType3MemsimV2Config;
 
 typedef struct CxlType3MemsimV2 {
     CxlType3MemsimV2Config config;
     CxlMemsimV2Client *client;
     bool enabled;
+    bool shutdown_state_loaded;
+    uint8_t shutdown_state;
+    uint32_t dirty_shutdown_count;
 } CxlType3MemsimV2;
 
 CxlType3MemsimV2Config cxl_type3_memsim_v2_default_config(void);
@@ -47,5 +51,13 @@ MemTxResult cxl_type3_memsim_v2_persist(CxlType3MemsimV2 *state);
 bool cxl_type3_memsim_v2_gpf(CxlType3MemsimV2 *state, unsigned phase,
                              Error **errp);
 uint16_t cxl_type3_memsim_v2_gpf_duration(const CxlType3MemsimV2Config *config);
+bool cxl_type3_memsim_v2_init_shutdown_state(CxlType3MemsimV2 *state,
+                                             Error **errp);
+bool cxl_type3_memsim_v2_set_shutdown_state(CxlType3MemsimV2 *state,
+                                            uint8_t value, Error **errp);
+uint8_t cxl_type3_memsim_v2_get_shutdown_state(
+    const CxlType3MemsimV2 *state);
+uint32_t cxl_type3_memsim_v2_dirty_shutdown_count(
+    const CxlType3MemsimV2 *state);
 
 #endif /* CXL_TYPE3_MEMSIM_V2_H */

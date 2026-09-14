@@ -148,6 +148,7 @@ static void test_type3_coherence_v2_properties(void)
     static const char * const expected[] = {
         "coherence-v2",
         "x-gpf",
+        "x-gpf-state-file",
         "cxlmemsim-addr",
         "cxlmemsim-port",
         "coherence-v2-host-id",
