@@ -344,7 +344,8 @@ static bool expect_putm(CachePeer *peer, uint8_t frame[CXL_MEMSIM_V2_FRAME_SIZE]
     return send_response(peer, frame, CXL_MEMSIM_V2_STATE_I, epoch, NULL, 0);
 }
 
-static bool expect_puts(CachePeer *peer, uint8_t frame[CXL_MEMSIM_V2_FRAME_SIZE],
+static bool expect_puts(CachePeer *peer,
+                        uint8_t frame[CXL_MEMSIM_V2_FRAME_SIZE],
                         uint64_t address, uint64_t epoch)
 {
     if (!expect_frame(peer, CXL_MEMSIM_V2_OP_PUTS, frame) ||
