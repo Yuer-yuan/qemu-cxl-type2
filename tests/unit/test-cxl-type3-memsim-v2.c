@@ -117,7 +117,7 @@ static void test_gpf_shutdown_state_survives_restart(void)
     second.config.gpf_state_file = path;
     g_assert_true(cxl_type3_memsim_v2_init_shutdown_state(&second, &err));
     g_assert_null(err);
-    g_assert_cmpuint(cxl_type3_memsim_v2_get_shutdown_state(&second), ==, 1);
+    g_assert_cmpuint(cxl_type3_memsim_v2_get_shutdown_state(&second), ==, 0);
     g_assert_cmpuint(cxl_type3_memsim_v2_dirty_shutdown_count(&second), ==, 1);
     g_assert_true(cxl_type3_memsim_v2_set_shutdown_state(&second, 0, &err));
 
@@ -156,6 +156,38 @@ static void test_gpf_shutdown_state_rejects_corruption(void)
     g_assert_cmpint(g_rmdir(directory), ==, 0);
 }
 
+static void test_gpf_dirty_shutdown_count_wraps(void)
+{
+    g_autofree char *directory = g_dir_make_tmp("qemu-gpf-state-XXXXXX",
+                                                NULL);
+    g_autofree char *path = g_build_filename(directory, "endpoint.state",
+                                             NULL);
+    CxlType3MemsimV2 armed = {
+        .config = cxl_type3_memsim_v2_default_config(),
+        .shutdown_state_loaded = true,
+        .shutdown_state = 0,
+        .dirty_shutdown_count = UINT32_MAX,
+    };
+    CxlType3MemsimV2 restarted = {
+        .config = cxl_type3_memsim_v2_default_config(),
+    };
+    Error *err = NULL;
+
+    armed.config.gpf = true;
+    armed.config.gpf_state_file = path;
+    g_assert_true(cxl_type3_memsim_v2_set_shutdown_state(&armed, 1, &err));
+    g_assert_null(err);
+    restarted.config.gpf = true;
+    restarted.config.gpf_state_file = path;
+    g_assert_true(cxl_type3_memsim_v2_init_shutdown_state(&restarted, &err));
+    g_assert_null(err);
+    g_assert_cmpuint(cxl_type3_memsim_v2_get_shutdown_state(&restarted), ==, 0);
+    g_assert_cmpuint(
+        cxl_type3_memsim_v2_dirty_shutdown_count(&restarted), ==, 0);
+    g_assert_cmpint(g_remove(path), ==, 0);
+    g_assert_cmpint(g_rmdir(directory), ==, 0);
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
@@ -164,6 +196,8 @@ int main(int argc, char **argv)
                     test_gpf_shutdown_state_survives_restart);
     g_test_add_func("/cxl/type3/memsim-v2/gpf-shutdown-state-corrupt",
                     test_gpf_shutdown_state_rejects_corruption);
+    g_test_add_func("/cxl/type3/memsim-v2/gpf-dirty-shutdown-count-wrap",
+                    test_gpf_dirty_shutdown_count_wraps);
     g_test_add_func("/cxl/type3/memsim-v2/default-config",
                     test_default_config_is_disabled_and_valid);
     g_test_add_func("/cxl/type3/memsim-v2/invalid-host-id",

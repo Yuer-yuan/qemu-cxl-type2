@@ -180,8 +180,9 @@ bool cxl_type3_memsim_v2_init_shutdown_state(CxlType3MemsimV2 *state,
     }
     shutdown_state = record.shutdown_state;
     count = le32_to_cpu(record.dirty_shutdown_count);
-    if (shutdown_state == CXL_TYPE3_SHUTDOWN_DIRTY && count != UINT32_MAX) {
+    if (shutdown_state == CXL_TYPE3_SHUTDOWN_DIRTY) {
         count++;
+        shutdown_state = CXL_TYPE3_SHUTDOWN_CLEAN;
     }
     if (!cxl_type3_gpf_state_store(state, shutdown_state, count, errp)) {
         return false;
