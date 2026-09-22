@@ -1516,9 +1516,31 @@ static bool cxl_type2_fabric_access_allowed(CXLType2State *ct2d, uint64_t addr,
 static uint64_t cxl_type2_device_mem_read(void *opaque, hwaddr addr, unsigned size)
 {
     CXLType2State *ct2d = opaque;
+    CXLMemSimResponse response;
+    uint64_t value = 0;
+    uint8_t *mem_ptr;
 
     if (!cxl_type2_fabric_access_allowed(ct2d, addr, size, false, false)) {
         return 0;
+    }
+
+    /*
+     * BAR4 is the CPU view of device-attached memory.  When the TCP backend
+     * is connected, its response is authoritative: another endpoint may
+     * have changed the backing bytes since this QEMU process last touched
+     * its local shadow.  The old path issued a READ but discarded its data,
+     * so external producer writes could never become visible to the guest.
+     */
+    if (cxl_type2_memsim_request(ct2d, CXL_OP_READ, addr, size, NULL,
+                                 &response)) {
+        memcpy(&value, response.data, size);
+        mem_ptr = memory_region_get_ram_ptr(&ct2d->device_mem);
+        if (mem_ptr && addr <= ct2d->device_mem_size - size) {
+            memcpy(mem_ptr + addr, response.data, size);
+        }
+        ct2d->stats.cpu_accesses++;
+        ct2d->stats.read_ops++;
+        return value;
     }
 
     /* Forward all device memory reads through the cache coherency layer */
