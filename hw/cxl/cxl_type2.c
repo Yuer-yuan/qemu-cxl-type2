@@ -1550,12 +1550,30 @@ static uint64_t cxl_type2_device_mem_read(void *opaque, hwaddr addr, unsigned si
 static void cxl_type2_device_mem_write(void *opaque, hwaddr addr, uint64_t value, unsigned size)
 {
     CXLType2State *ct2d = opaque;
+    uint8_t *mem_ptr;
 
     if (!cxl_type2_fabric_access_allowed(ct2d, addr, size, true, false)) {
         return;
     }
 
-    /* Forward all device memory writes through the cache coherency layer */
+    /*
+     * Keep the authoritative backend and the local shadow in sync.  Taking
+     * the generic cache-write path here can re-enter BAR coherency while an
+     * MMIO store is in progress, preventing the request from reaching the
+     * backend.  BAR4 CPU stores need one write-through transaction.
+     */
+    if (cxl_type2_memsim_request(ct2d, CXL_OP_WRITE, addr, size,
+                                 (const uint8_t *)&value, NULL)) {
+        mem_ptr = memory_region_get_ram_ptr(&ct2d->device_mem);
+        if (mem_ptr && addr <= ct2d->device_mem_size - size) {
+            memcpy(mem_ptr + addr, &value, size);
+        }
+        ct2d->stats.cpu_accesses++;
+        ct2d->stats.write_ops++;
+        return;
+    }
+
+    /* Preserve the local fallback when no external backend is available. */
     cxl_type2_cache_write(opaque, addr, value, size);
 }
 
