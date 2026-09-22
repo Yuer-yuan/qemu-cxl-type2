@@ -56,6 +56,7 @@
 #define CXL_OP_BI_INVALIDATE 16
 #define CXL_OP_BI_WRITEBACK 17
 #define CXL_OP_BI_QUERY     18
+#define CXL_OP_NCP_HOST_REGISTER 19
 
 typedef struct QEMU_PACKED CXLMemSimRequest {
     uint8_t op_type;
@@ -1301,6 +1302,12 @@ static void cxlmemsim_connect(CXLType2State *ct2d)
 
     qemu_log("CXL Type2: Connected to CXLMemSim at %s:%u\n",
             ct2d->memsim.server_addr, ct2d->memsim.server_port);
+    if (!cxl_type2_memsim_request(ct2d, CXL_OP_NCP_HOST_REGISTER,
+                                  0, 0, NULL, NULL)) {
+        qemu_log("CXL Type2: Failed to register host requester with CXLMemSim\n");
+    } else {
+        qemu_log("CXL Type2: Registered host requester with CXLMemSim\n");
+    }
 }
 
 static void cxlmemsim_disconnect(CXLType2State *ct2d)
