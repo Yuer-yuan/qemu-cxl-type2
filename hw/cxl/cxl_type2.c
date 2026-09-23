@@ -26,6 +26,7 @@
 #include "hw/cxl/cxl_cdat.h"
 #include "hw/cxl/cxl_pci.h"
 #include "hw/cxl/cxl_type2.h"
+#include "hw/cxl/cxl_ncp_host_cache.h"
 #include "hw/cxl/cxl_hetgpu.h"
 #include "hw/cxl/cxl_type2_gpu_cmd.h"
 #include "hw/cxl/cxl_type2_coherency.h"
@@ -87,6 +88,8 @@ static bool cxl_type2_memsim_request(CXLType2State *ct2d, uint8_t op_type,
                                      uint64_t addr, uint64_t size,
                                      const uint8_t *data,
                                      CXLMemSimResponse *resp);
+static bool cxl_type2_ncp_backing(void *opaque, bool write,
+                                  uint64_t address, uint8_t data[64]);
 
 /* ========================================================================
  * Coherency Protocol Implementation
@@ -1302,11 +1305,13 @@ static void cxlmemsim_connect(CXLType2State *ct2d)
 
     qemu_log("CXL Type2: Connected to CXLMemSim at %s:%u\n",
             ct2d->memsim.server_addr, ct2d->memsim.server_port);
-    if (!cxl_type2_memsim_request(ct2d, CXL_OP_NCP_HOST_REGISTER,
-                                  0, 0, NULL, NULL)) {
-        qemu_log("CXL Type2: Failed to register host requester with CXLMemSim\n");
-    } else {
-        qemu_log("CXL Type2: Registered host requester with CXLMemSim\n");
+    if (!ct2d->ncp_ingress_port) {
+        if (!cxl_type2_memsim_request(ct2d, CXL_OP_NCP_HOST_REGISTER,
+                                      0, 0, NULL, NULL)) {
+            qemu_log("CXL Type2: Failed to register host requester with CXLMemSim\n");
+        } else {
+            qemu_log("CXL Type2: Registered host requester with CXLMemSim\n");
+        }
     }
 }
 
@@ -1391,6 +1396,23 @@ static bool cxl_type2_memsim_request(CXLType2State *ct2d, uint8_t op_type,
 {
     return cxl_type2_memsim_request_ext(ct2d, op_type, addr, size, data, 0, 0,
                                         resp);
+}
+
+static bool cxl_type2_ncp_backing(void *opaque, bool write,
+                                  uint64_t address, uint8_t data[64])
+{
+    CXLType2State *ct2d = opaque;
+    CXLMemSimResponse response;
+    if (write) {
+        return cxl_type2_memsim_request(ct2d, CXL_OP_WRITE, address, 64,
+                                        data, NULL);
+    }
+    if (!cxl_type2_memsim_request(ct2d, CXL_OP_READ, address, 64,
+                                  NULL, &response)) {
+        return false;
+    }
+    memcpy(data, response.data, 64);
+    return true;
 }
 
 /* ========================================================================
@@ -1531,6 +1553,16 @@ static uint64_t cxl_type2_device_mem_read(void *opaque, hwaddr addr, unsigned si
         return 0;
     }
 
+    if (ct2d->ncp_host_cache) {
+        if (!cxl_ncp_host_cache_read(ct2d->ncp_host_cache, addr, size, &value)) {
+            error_report("CXL Type2: QEMU host cache read failed at 0x%" HWADDR_PRIx, addr);
+            return 0;
+        }
+        ct2d->stats.cpu_accesses++;
+        ct2d->stats.read_ops++;
+        return value;
+    }
+
     /*
      * BAR4 is the CPU view of device-attached memory.  When the TCP backend
      * is connected, its response is authoritative: another endpoint may
@@ -1560,6 +1592,16 @@ static void cxl_type2_device_mem_write(void *opaque, hwaddr addr, uint64_t value
     uint8_t *mem_ptr;
 
     if (!cxl_type2_fabric_access_allowed(ct2d, addr, size, true, false)) {
+        return;
+    }
+
+    if (ct2d->ncp_host_cache) {
+        if (!cxl_ncp_host_cache_write(ct2d->ncp_host_cache, addr, size, value)) {
+            error_report("CXL Type2: QEMU host cache write failed at 0x%" HWADDR_PRIx, addr);
+            return;
+        }
+        ct2d->stats.cpu_accesses++;
+        ct2d->stats.write_ops++;
         return;
     }
 
@@ -3611,6 +3653,22 @@ static void cxl_type2_realize(PCIDevice *pci_dev, Error **errp)
     /* Connect to CXLMemSim. The TCP server protocol is request/response. */
     cxlmemsim_connect(ct2d);
 
+    if (ct2d->ncp_ingress_port) {
+        if (!ct2d->memsim.connected) {
+            error_setg(errp, "QEMU NC-P host cache requires CXLMemSim backing");
+            return;
+        }
+        ct2d->ncp_host_cache = cxl_ncp_host_cache_new(
+            ct2d->ncp_ingress_port, ct2d->device_mem_size,
+            ct2d->ncp_host_sets, ct2d->ncp_host_ways,
+            cxl_type2_ncp_backing, ct2d, errp);
+        if (!ct2d->ncp_host_cache) {
+            return;
+        }
+        qemu_log("CXL Type2: QEMU host NC-P cache active on 127.0.0.1:%u\n",
+                 ct2d->ncp_ingress_port);
+    }
+
     qemu_log("CXL Type2: Device realized - Cache: %zu MB, DevMem: %zu MB\n",
              ct2d->cache_size / MiB, ct2d->device_mem_size / MiB);
 }
@@ -3618,6 +3676,9 @@ static void cxl_type2_realize(PCIDevice *pci_dev, Error **errp)
 static void cxl_type2_exit(PCIDevice *pci_dev)
 {
     CXLType2State *ct2d = CXL_TYPE2(pci_dev);
+
+    cxl_ncp_host_cache_free(ct2d->ncp_host_cache);
+    ct2d->ncp_host_cache = NULL;
 
     /* Disconnect from CXLMemSim */
     cxlmemsim_disconnect(ct2d);
@@ -3682,6 +3743,9 @@ static const Property cxl_type2_props[] = {
     DEFINE_PROP_BOOL("hdm-db", CXLType2State, hdmdb, true),
     DEFINE_PROP_STRING("cxlmemsim-addr", CXLType2State, memsim.server_addr),
     DEFINE_PROP_UINT16("cxlmemsim-port", CXLType2State, memsim.server_port, 9999),
+    DEFINE_PROP_UINT16("ncp-ingress-port", CXLType2State, ncp_ingress_port, 0),
+    DEFINE_PROP_UINT32("ncp-host-sets", CXLType2State, ncp_host_sets, 64),
+    DEFINE_PROP_UINT32("ncp-host-ways", CXLType2State, ncp_host_ways, 8),
     DEFINE_PROP_STRING("gpu-device", CXLType2State, gpu_info.vfio_device),
     DEFINE_PROP_BOOL("coherency-enabled", CXLType2State,
                      coherency.coherency_enabled, true),

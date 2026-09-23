@@ -247,6 +247,12 @@ typedef struct CXLType2State {
     /* CXLMemSim connection */
     CXLType2MemSimConn memsim;
 
+    /* Optional QEMU-side host cache for the NC-P ingress experiment. */
+    struct CXLNCPHostCache *ncp_host_cache;
+    uint16_t ncp_ingress_port;
+    uint32_t ncp_host_sets;
+    uint32_t ncp_host_ways;
+
     /* Memory backend for device memory */
     HostMemoryBackend *hostmem;
 
