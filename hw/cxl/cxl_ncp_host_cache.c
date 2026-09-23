@@ -107,6 +107,8 @@ struct CXLNCPHostCache {
     uint64_t cache_d2h_data_bytes;
     uint64_t cache_h2d_go_i;
     uint64_t dcoh_invalidations;
+    uint64_t nc_d2h_write_requests;
+    uint64_t nc_memwr_fwd;
     uint64_t mem_m2s_reads;
     uint64_t mem_s2m_read_data_bytes;
     uint64_t mem_s2m_read_completions;
@@ -404,6 +406,12 @@ static bool ncp_producer_write_locked(CXLNCPHostCache *cache,
         return ncp_raw_write_locked(cache, req->address, req->size,
                                     req->data, false);
     }
+    if (req->op == NCP_OP_NC_WRITE) {
+        /* Host-bias device-memory NC-write: WOWrInv/F asks the Host to
+         * resolve coherence before MemWrFwd permits a local media write.
+         */
+        ++cache->nc_d2h_write_requests;
+    }
     if (!ncp_fetch(cache, address, data, false, false)) {
         return false;
     }
@@ -426,8 +434,13 @@ static bool ncp_producer_write_locked(CXLNCPHostCache *cache,
         cache->ddio_bytes += req->size;
         cache->producer_backing_writes[0] += NCP_LINE_BYTES;
     } else {
-        /* The merged line is authoritative, so discard a dirty cache copy. */
-        ncp_invalidate(cache, address, false);
+        /* ncp_fetch took the most recent host copy for partial-line merge.
+         * MemWrFwd follows host invalidation; DCOH then writes NIC memory.
+         */
+        if (!ncp_invalidate(cache, address, false)) {
+            return false;
+        }
+        ++cache->nc_memwr_fwd;
         if (!cache->backing(cache->backing_opaque, true, address, data)) {
             return false;
         }
@@ -488,6 +501,8 @@ static void ncp_response_locked(CXLNCPHostCache *cache,
         values[3] = cache->cache_d2h_data_bytes;
         values[4] = cache->cache_h2d_go_i;
         values[5] = cache->dcoh_invalidations;
+        values[6] = cache->nc_d2h_write_requests;
+        values[7] = cache->nc_memwr_fwd;
     } else if (req->op == NCP_OP_MEM_PROTOCOL_QUERY) {
         values[0] = cache->mem_m2s_reads;
         values[1] = cache->mem_s2m_read_data_bytes;
