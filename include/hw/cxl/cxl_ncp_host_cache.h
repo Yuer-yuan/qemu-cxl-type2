@@ -19,8 +19,8 @@ CXLNCPHostCache *cxl_ncp_host_cache_new(uint16_t port, uint64_t capacity,
                                        void *backing_opaque, Error **errp);
 void cxl_ncp_host_cache_free(CXLNCPHostCache *cache);
 bool cxl_ncp_host_cache_read(CXLNCPHostCache *cache, uint64_t address,
-                             unsigned size, uint64_t *value);
+                             unsigned size, uint64_t *value, bool cxl_mem);
 bool cxl_ncp_host_cache_write(CXLNCPHostCache *cache, uint64_t address,
-                              unsigned size, uint64_t value);
+                              unsigned size, uint64_t value, bool cxl_mem);
 
 #endif

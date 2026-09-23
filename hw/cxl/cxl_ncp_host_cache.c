@@ -1,8 +1,10 @@
-/* QEMU-side host LLC and simulated Type 2 NC-P ingress.
+/* QEMU-side host cache and Type 2 CXL.cache/CXL.mem transaction model.
  *
- * This is a functional cache/coherence model, not a timing model of a CPU LLC
- * or the physical CXL.cache link.  The localhost ingress represents a NIC
- * command source; each response is sent after the cache/backing update.
+ * The localhost ingress represents the NIC logic's D2D request to its DCOH.
+ * NC-P is a device-side hint, not a CXL.cache wire opcode.  We model the
+ * CXL.cache D2H Write message sequence without claiming an exact Agilex
+ * opcode mapping.  CXL.mem host reads/writes are counted separately.  This is
+ * a transaction-level functional model, not a link or CPU timing model.
  */
 #include "qemu/osdep.h"
 #include "qemu/bswap.h"
@@ -24,6 +26,8 @@
 #define NCP_OP_TRAFFIC_QUERY 25
 #define NCP_OP_NC_WRITE 26
 #define NCP_OP_DEMAND_RANGE 27
+#define NCP_OP_CACHE_PROTOCOL_QUERY 28
+#define NCP_OP_MEM_PROTOCOL_QUERY 29
 
 typedef struct QEMU_PACKED NCPRequest {
     uint8_t op;
@@ -55,6 +59,22 @@ typedef struct NCPDemand {
     uint64_t hits;
 } NCPDemand;
 
+typedef enum NCPPushPhase {
+    NCP_DCOH_STAGED,
+    NCP_D2H_REQUEST,
+    NCP_H2D_WRITE_PULL,
+    NCP_D2H_DATA,
+    NCP_H2D_GO_I,
+    NCP_DCOH_INVALID,
+} NCPPushPhase;
+
+typedef struct NCPPushTransaction {
+    uint64_t address;
+    uint8_t data[NCP_LINE_BYTES];
+    NCPPushPhase phase;
+    bool device_line_valid;
+} NCPPushTransaction;
+
 struct CXLNCPHostCache {
     QemuMutex lock;
     QemuThread thread;
@@ -81,6 +101,20 @@ struct CXLNCPHostCache {
     uint64_t first_backing_reads[2];
     uint64_t dirty_backing_writes[2];
     uint64_t producer_backing_writes[2];
+    uint64_t dcoh_staged;
+    uint64_t cache_d2h_requests;
+    uint64_t cache_h2d_write_pulls;
+    uint64_t cache_d2h_data_bytes;
+    uint64_t cache_h2d_go_i;
+    uint64_t dcoh_invalidations;
+    uint64_t mem_m2s_reads;
+    uint64_t mem_s2m_read_data_bytes;
+    uint64_t mem_s2m_read_completions;
+    uint64_t mem_m2s_writes;
+    uint64_t mem_m2s_write_data_bytes;
+    uint64_t mem_s2m_write_completions;
+    uint64_t mem_dirty_writeback_bytes;
+    uint64_t dcoh_read_misses;
     uint32_t sets;
     uint32_t ways;
     int listener;
@@ -119,13 +153,23 @@ static NCPLine *ncp_find(CXLNCPHostCache *cache, uint64_t address)
 
 static bool ncp_writeback(CXLNCPHostCache *cache, NCPLine *line)
 {
+    int home;
+
     if (!line->dirty) {
         return true;
+    }
+    home = ncp_home(cache, line->address);
+    if (home == 1) {
+        ++cache->mem_m2s_writes;
     }
     if (!cache->backing(cache->backing_opaque, true, line->address, line->data)) {
         return false;
     }
-    int home = ncp_home(cache, line->address);
+    if (home == 1) {
+        cache->mem_m2s_write_data_bytes += NCP_LINE_BYTES;
+        cache->mem_dirty_writeback_bytes += NCP_LINE_BYTES;
+        ++cache->mem_s2m_write_completions;
+    }
     if (home >= 0) {
         cache->dirty_backing_writes[home] += NCP_LINE_BYTES;
     }
@@ -182,7 +226,7 @@ static bool ncp_invalidate(CXLNCPHostCache *cache, uint64_t address,
 }
 
 static bool ncp_fetch(CXLNCPHostCache *cache, uint64_t address,
-                      uint8_t data[NCP_LINE_BYTES], bool demand)
+                      uint8_t data[NCP_LINE_BYTES], bool demand, bool cxl_mem)
 {
     NCPLine *line = ncp_find(cache, address);
     if (line) {
@@ -190,8 +234,16 @@ static bool ncp_fetch(CXLNCPHostCache *cache, uint64_t address,
         line->last_use = ++cache->clock;
         return true;
     }
+    if (cxl_mem) {
+        ++cache->mem_m2s_reads;
+        ++cache->dcoh_read_misses;
+    }
     if (!cache->backing(cache->backing_opaque, false, address, data)) {
         return false;
+    }
+    if (cxl_mem) {
+        cache->mem_s2m_read_data_bytes += NCP_LINE_BYTES;
+        ++cache->mem_s2m_read_completions;
     }
     if (demand) {
         int home = ncp_home(cache, address);
@@ -234,12 +286,12 @@ static void ncp_record_demand(CXLNCPHostCache *cache, uint64_t address,
 }
 
 static bool ncp_guest_read_locked(CXLNCPHostCache *cache, uint64_t address,
-                                  unsigned size, uint64_t *value)
+                                  unsigned size, uint64_t *value, bool cxl_mem)
 {
     uint64_t line_address = address & ~(uint64_t)(NCP_LINE_BYTES - 1);
     uint8_t data[NCP_LINE_BYTES];
     bool hit = ncp_find(cache, line_address) != NULL;
-    bool ok = ncp_fetch(cache, line_address, data, true);
+    bool ok = ncp_fetch(cache, line_address, data, true, cxl_mem);
     if (!ok || (!hit && !ncp_install(cache, line_address, data, false))) {
         return false;
     }
@@ -254,20 +306,31 @@ static bool ncp_guest_read_locked(CXLNCPHostCache *cache, uint64_t address,
 }
 
 static bool ncp_raw_write_locked(CXLNCPHostCache *cache, uint64_t address,
-                                 unsigned size, const uint8_t *bytes)
+                                 unsigned size, const uint8_t *bytes,
+                                 bool cxl_mem)
 {
     uint64_t line_address = address & ~(uint64_t)(NCP_LINE_BYTES - 1);
     uint8_t data[NCP_LINE_BYTES];
     if (!ncp_invalidate(cache, line_address, true) ||
-        !ncp_fetch(cache, line_address, data, false)) {
+        !ncp_fetch(cache, line_address, data, false, false)) {
         return false;
     }
     memcpy(data + (address - line_address), bytes, size);
-    return cache->backing(cache->backing_opaque, true, line_address, data);
+    if (cxl_mem) {
+        ++cache->mem_m2s_writes;
+    }
+    if (!cache->backing(cache->backing_opaque, true, line_address, data)) {
+        return false;
+    }
+    if (cxl_mem) {
+        cache->mem_m2s_write_data_bytes += size;
+        ++cache->mem_s2m_write_completions;
+    }
+    return true;
 }
 
 bool cxl_ncp_host_cache_read(CXLNCPHostCache *cache, uint64_t address,
-                             unsigned size, uint64_t *value)
+                             unsigned size, uint64_t *value, bool cxl_mem)
 {
     bool ok;
     if (!cache || !value || !size || size > 8 ||
@@ -276,13 +339,13 @@ bool cxl_ncp_host_cache_read(CXLNCPHostCache *cache, uint64_t address,
         return false;
     }
     qemu_mutex_lock(&cache->lock);
-    ok = ncp_guest_read_locked(cache, address, size, value);
+    ok = ncp_guest_read_locked(cache, address, size, value, cxl_mem);
     qemu_mutex_unlock(&cache->lock);
     return ok;
 }
 
 bool cxl_ncp_host_cache_write(CXLNCPHostCache *cache, uint64_t address,
-                              unsigned size, uint64_t value)
+                              unsigned size, uint64_t value, bool cxl_mem)
 {
     bool ok;
     if (!cache || !size || size > 8 ||
@@ -291,9 +354,44 @@ bool cxl_ncp_host_cache_write(CXLNCPHostCache *cache, uint64_t address,
         return false;
     }
     qemu_mutex_lock(&cache->lock);
-    ok = ncp_raw_write_locked(cache, address, size, (const uint8_t *)&value);
+    ok = ncp_raw_write_locked(cache, address, size,
+                              (const uint8_t *)&value, cxl_mem);
     qemu_mutex_unlock(&cache->lock);
     return ok;
+}
+
+/* Non-posted D2H Write semantic: DCOH stages a complete line, sends a D2H
+ * request, receives WritePull, transfers 64 bytes, then receives GO-I only
+ * after the host model has accepted the data.  Only then is the DCOH copy
+ * invalidated and the NIC request completed.  Host allocation is the explicit
+ * NC-P policy used by this experiment, not a CXL.cache standard guarantee.
+ */
+static bool ncp_dcoh_push_locked(CXLNCPHostCache *cache, uint64_t address,
+                                 const uint8_t data[NCP_LINE_BYTES])
+{
+    NCPPushTransaction txn = {
+        .address = address,
+        .phase = NCP_DCOH_STAGED,
+        .device_line_valid = true,
+    };
+
+    memcpy(txn.data, data, NCP_LINE_BYTES);
+    ++cache->dcoh_staged;
+    txn.phase = NCP_D2H_REQUEST;
+    ++cache->cache_d2h_requests;
+    txn.phase = NCP_H2D_WRITE_PULL;
+    ++cache->cache_h2d_write_pulls;
+    txn.phase = NCP_D2H_DATA;
+    if (!ncp_install(cache, txn.address, txn.data, true)) {
+        return false;
+    }
+    cache->cache_d2h_data_bytes += NCP_LINE_BYTES;
+    txn.phase = NCP_H2D_GO_I;
+    ++cache->cache_h2d_go_i;
+    txn.device_line_valid = false;
+    txn.phase = NCP_DCOH_INVALID;
+    ++cache->dcoh_invalidations;
+    return txn.phase == NCP_DCOH_INVALID && !txn.device_line_valid;
 }
 
 static bool ncp_producer_write_locked(CXLNCPHostCache *cache,
@@ -303,14 +401,15 @@ static bool ncp_producer_write_locked(CXLNCPHostCache *cache,
     uint8_t data[NCP_LINE_BYTES];
     int home;
     if (req->op == NCP_OP_WRITE) {
-        return ncp_raw_write_locked(cache, req->address, req->size, req->data);
+        return ncp_raw_write_locked(cache, req->address, req->size,
+                                    req->data, false);
     }
-    if (!ncp_fetch(cache, address, data, false)) {
+    if (!ncp_fetch(cache, address, data, false, false)) {
         return false;
     }
     memcpy(data + (req->address - address), req->data, req->size);
     if (req->op == NCP_OP_PUSH) {
-        if (!ncp_install(cache, address, data, true)) {
+        if (!ncp_dcoh_push_locked(cache, address, data)) {
             return false;
         }
         home = 1;
@@ -382,6 +481,22 @@ static void ncp_response_locked(CXLNCPHostCache *cache,
         values[5] = cache->dirty_backing_writes[1];
         values[6] = cache->producer_backing_writes[0];
         values[7] = cache->producer_backing_writes[1];
+    } else if (req->op == NCP_OP_CACHE_PROTOCOL_QUERY) {
+        values[0] = cache->dcoh_staged;
+        values[1] = cache->cache_d2h_requests;
+        values[2] = cache->cache_h2d_write_pulls;
+        values[3] = cache->cache_d2h_data_bytes;
+        values[4] = cache->cache_h2d_go_i;
+        values[5] = cache->dcoh_invalidations;
+    } else if (req->op == NCP_OP_MEM_PROTOCOL_QUERY) {
+        values[0] = cache->mem_m2s_reads;
+        values[1] = cache->mem_s2m_read_data_bytes;
+        values[2] = cache->mem_s2m_read_completions;
+        values[3] = cache->mem_m2s_writes;
+        values[4] = cache->mem_m2s_write_data_bytes;
+        values[5] = cache->mem_s2m_write_completions;
+        values[6] = cache->mem_dirty_writeback_bytes;
+        values[7] = cache->dcoh_read_misses;
     } else if (req->op == NCP_OP_DEMAND_RANGE) {
         if (req->address % 64 || !req->value || req->value % 64 ||
             req->value > (1 << 20) || req->address >= cache->capacity ||

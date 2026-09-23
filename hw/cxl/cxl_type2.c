@@ -1554,7 +1554,8 @@ static uint64_t cxl_type2_device_mem_read(void *opaque, hwaddr addr, unsigned si
     }
 
     if (ct2d->ncp_host_cache) {
-        if (!cxl_ncp_host_cache_read(ct2d->ncp_host_cache, addr, size, &value)) {
+        if (!cxl_ncp_host_cache_read(ct2d->ncp_host_cache, addr, size,
+                                     &value, false)) {
             error_report("CXL Type2: QEMU host cache read failed at 0x%" HWADDR_PRIx, addr);
             return 0;
         }
@@ -1596,7 +1597,8 @@ static void cxl_type2_device_mem_write(void *opaque, hwaddr addr, uint64_t value
     }
 
     if (ct2d->ncp_host_cache) {
-        if (!cxl_ncp_host_cache_write(ct2d->ncp_host_cache, addr, size, value)) {
+        if (!cxl_ncp_host_cache_write(ct2d->ncp_host_cache, addr, size,
+                                      value, false)) {
             error_report("CXL Type2: QEMU host cache write failed at 0x%" HWADDR_PRIx, addr);
             return;
         }
@@ -1724,7 +1726,8 @@ MemTxResult cxl_type2_read(PCIDevice *d, hwaddr host_addr, uint64_t *data,
         return MEMTX_ERROR;
     }
     if (ct2d->ncp_host_cache) {
-        if (!cxl_ncp_host_cache_read(ct2d->ncp_host_cache, dpa, size, data)) {
+        if (!cxl_ncp_host_cache_read(ct2d->ncp_host_cache, dpa, size,
+                                     data, true)) {
             return MEMTX_ERROR;
         }
     } else if (ct2d->memsim.connected) {
@@ -1763,7 +1766,8 @@ MemTxResult cxl_type2_write(PCIDevice *d, hwaddr host_addr, uint64_t data,
         return MEMTX_ERROR;
     }
     if (ct2d->ncp_host_cache) {
-        if (!cxl_ncp_host_cache_write(ct2d->ncp_host_cache, dpa, size, data)) {
+        if (!cxl_ncp_host_cache_write(ct2d->ncp_host_cache, dpa, size,
+                                      data, true)) {
             return MEMTX_ERROR;
         }
     } else if (ct2d->memsim.connected) {
