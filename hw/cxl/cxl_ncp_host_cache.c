@@ -368,6 +368,40 @@ bool cxl_ncp_host_cache_write(CXLNCPHostCache *cache, uint64_t address,
  * invalidated and the NIC request completed.  Host allocation is the explicit
  * NC-P policy used by this experiment, not a CXL.cache standard guarantee.
  */
+static bool ncp_cache_step_locked(CXLNCPHostCache *cache,
+                                  NCPPushTransaction *txn,
+                                  NCPPushPhase next)
+{
+    if (!txn->device_line_valid || (int)next != (int)txn->phase + 1) {
+        return false;
+    }
+    switch (next) {
+    case NCP_D2H_REQUEST:
+        ++cache->cache_d2h_requests;
+        break;
+    case NCP_H2D_WRITE_PULL:
+        ++cache->cache_h2d_write_pulls;
+        break;
+    case NCP_D2H_DATA:
+        if (!ncp_install(cache, txn->address, txn->data, true)) {
+            return false;
+        }
+        cache->cache_d2h_data_bytes += NCP_LINE_BYTES;
+        break;
+    case NCP_H2D_GO_I:
+        ++cache->cache_h2d_go_i;
+        break;
+    case NCP_DCOH_INVALID:
+        txn->device_line_valid = false;
+        ++cache->dcoh_invalidations;
+        break;
+    default:
+        return false;
+    }
+    txn->phase = next;
+    return true;
+}
+
 static bool ncp_dcoh_push_locked(CXLNCPHostCache *cache, uint64_t address,
                                  const uint8_t data[NCP_LINE_BYTES])
 {
@@ -379,21 +413,12 @@ static bool ncp_dcoh_push_locked(CXLNCPHostCache *cache, uint64_t address,
 
     memcpy(txn.data, data, NCP_LINE_BYTES);
     ++cache->dcoh_staged;
-    txn.phase = NCP_D2H_REQUEST;
-    ++cache->cache_d2h_requests;
-    txn.phase = NCP_H2D_WRITE_PULL;
-    ++cache->cache_h2d_write_pulls;
-    txn.phase = NCP_D2H_DATA;
-    if (!ncp_install(cache, txn.address, txn.data, true)) {
-        return false;
+    for (int phase = NCP_D2H_REQUEST; phase <= NCP_DCOH_INVALID; ++phase) {
+        if (!ncp_cache_step_locked(cache, &txn, (NCPPushPhase)phase)) {
+            return false;
+        }
     }
-    cache->cache_d2h_data_bytes += NCP_LINE_BYTES;
-    txn.phase = NCP_H2D_GO_I;
-    ++cache->cache_h2d_go_i;
-    txn.device_line_valid = false;
-    txn.phase = NCP_DCOH_INVALID;
-    ++cache->dcoh_invalidations;
-    return txn.phase == NCP_DCOH_INVALID && !txn.device_line_valid;
+    return !txn.device_line_valid;
 }
 
 static bool ncp_producer_write_locked(CXLNCPHostCache *cache,
