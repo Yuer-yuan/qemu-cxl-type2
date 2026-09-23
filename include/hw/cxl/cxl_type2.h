@@ -272,6 +272,8 @@ typedef struct CXLType2State {
         uint64_t write_ops;
         uint64_t gpu_accesses;
         uint64_t cpu_accesses;
+        uint64_t hdm_reads;
+        uint64_t hdm_writes;
         uint64_t coherency_violations;
     } stats;
 
@@ -284,6 +286,11 @@ typedef struct CXLType2State {
 } CXLType2State;
 
 #define CXL_TYPE2(obj) OBJECT_CHECK(CXLType2State, (obj), TYPE_CXL_TYPE2)
+
+MemTxResult cxl_type2_read(PCIDevice *d, hwaddr host_addr, uint64_t *data,
+                           unsigned size, MemTxAttrs attrs);
+MemTxResult cxl_type2_write(PCIDevice *d, hwaddr host_addr, uint64_t data,
+                            unsigned size, MemTxAttrs attrs);
 
 /* Message types for CXLMemSim communication */
 enum CXLType2MsgType {

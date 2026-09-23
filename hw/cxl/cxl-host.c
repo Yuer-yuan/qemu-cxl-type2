@@ -16,6 +16,7 @@
 #include "qapi/qapi-visit-machine.h"
 #include "hw/cxl/cxl.h"
 #include "hw/cxl/cxl_host.h"
+#include "hw/cxl/cxl_type2.h"
 #include "hw/pci/pci_bus.h"
 #include "hw/pci/pci_bridge.h"
 #include "hw/pci/pci_host.h"
@@ -213,7 +214,8 @@ static PCIDevice *cxl_cfmws_find_device(CXLFixedWindow *fw, hwaddr addr)
         return NULL;
     }
 
-    if (object_dynamic_cast(OBJECT(d), TYPE_CXL_TYPE3)) {
+    if (object_dynamic_cast(OBJECT(d), TYPE_CXL_TYPE3) ||
+        object_dynamic_cast(OBJECT(d), TYPE_CXL_TYPE2)) {
         return d;
     }
 
@@ -248,7 +250,8 @@ static PCIDevice *cxl_cfmws_find_device(CXLFixedWindow *fw, hwaddr addr)
         return NULL;
     }
 
-    if (!object_dynamic_cast(OBJECT(d), TYPE_CXL_TYPE3)) {
+    if (!object_dynamic_cast(OBJECT(d), TYPE_CXL_TYPE3) &&
+        !object_dynamic_cast(OBJECT(d), TYPE_CXL_TYPE2)) {
         return NULL;
     }
 
@@ -268,6 +271,9 @@ static MemTxResult cxl_read_cfmws(void *opaque, hwaddr addr, uint64_t *data,
         return MEMTX_ERROR;
     }
 
+    if (object_dynamic_cast(OBJECT(d), TYPE_CXL_TYPE2)) {
+        return cxl_type2_read(d, addr + fw->base, data, size, attrs);
+    }
     return cxl_type3_read(d, addr + fw->base, data, size, attrs);
 }
 
@@ -284,6 +290,9 @@ static MemTxResult cxl_write_cfmws(void *opaque, hwaddr addr,
         return MEMTX_OK;
     }
 
+    if (object_dynamic_cast(OBJECT(d), TYPE_CXL_TYPE2)) {
+        return cxl_type2_write(d, addr + fw->base, data, size, attrs);
+    }
     return cxl_type3_write(d, addr + fw->base, data, size, attrs);
 }
 

@@ -1654,6 +1654,136 @@ static const MemoryRegionOps cxl_type2_device_mem_ops = {
     },
 };
 
+/* Translate a host CXL fixed-window address through a committed Type 2 HDM
+ * decoder.  This experiment uses one target per decoder; unsupported endpoint
+ * interleave configurations fail instead of silently reading the wrong DPA.
+ */
+static bool cxl_type2_hpa_to_dpa(CXLType2State *ct2d, hwaddr host_addr,
+                                  unsigned size, uint64_t *dpa)
+{
+    uint32_t *regs = ct2d->cxl_cstate.crb.cache_mem_registers;
+    unsigned count = cxl_decoder_count_dec(FIELD_EX32(
+        ldl_le_p(regs + R_CXL_HDM_DECODER_CAPABILITY),
+        CXL_HDM_DECODER_CAPABILITY, DECODER_COUNT));
+    int stride = R_CXL_HDM_DECODER1_BASE_LO - R_CXL_HDM_DECODER0_BASE_LO;
+    uint64_t dpa_base = 0;
+
+    for (unsigned i = 0; i < count; i++) {
+        uint32_t base_lo = ldl_le_p(regs + R_CXL_HDM_DECODER0_BASE_LO + i * stride);
+        uint32_t size_lo = ldl_le_p(regs + R_CXL_HDM_DECODER0_SIZE_LO + i * stride);
+        uint32_t skip_lo = ldl_le_p(regs + R_CXL_HDM_DECODER0_DPA_SKIP_LO + i * stride);
+        uint32_t ctrl = ldl_le_p(regs + R_CXL_HDM_DECODER0_CTRL + i * stride);
+        uint64_t base = ((uint64_t)ldl_le_p(regs + R_CXL_HDM_DECODER0_BASE_HI +
+                                              i * stride) << 32) |
+                        (base_lo & 0xf0000000);
+        uint64_t length = ((uint64_t)ldl_le_p(regs + R_CXL_HDM_DECODER0_SIZE_HI +
+                                                i * stride) << 32) |
+                          (size_lo & 0xf0000000);
+        uint64_t skip = ((uint64_t)ldl_le_p(regs + R_CXL_HDM_DECODER0_DPA_SKIP_HI +
+                                              i * stride) << 32) |
+                        (skip_lo & 0xf0000000);
+
+        if (UINT64_MAX - dpa_base < skip) {
+            return false;
+        }
+        dpa_base += skip;
+        if (!FIELD_EX32(ctrl, CXL_HDM_DECODER0_CTRL, COMMITTED) ||
+            !length || FIELD_EX32(ctrl, CXL_HDM_DECODER0_CTRL, IW)) {
+            return false;
+        }
+        if (host_addr >= base && host_addr - base < length) {
+            uint64_t offset = host_addr - base;
+            if (!size || size > length - offset ||
+                dpa_base > ct2d->device_mem_size ||
+                offset > ct2d->device_mem_size - dpa_base ||
+                size > ct2d->device_mem_size - dpa_base - offset) {
+                return false;
+            }
+            *dpa = dpa_base + offset;
+            return true;
+        }
+        if (UINT64_MAX - dpa_base < length) {
+            return false;
+        }
+        dpa_base += length;
+    }
+    return false;
+}
+
+MemTxResult cxl_type2_read(PCIDevice *d, hwaddr host_addr, uint64_t *data,
+                           unsigned size, MemTxAttrs attrs)
+{
+    CXLType2State *ct2d = CXL_TYPE2(d);
+    CXLMemSimResponse response;
+    uint64_t dpa;
+    uint8_t *memory;
+
+    (void)attrs;
+    if (!cxl_type2_hpa_to_dpa(ct2d, host_addr, size, &dpa) ||
+        !cxl_type2_fabric_access_allowed(ct2d, dpa, size, false, false)) {
+        return MEMTX_ERROR;
+    }
+    if (ct2d->ncp_host_cache) {
+        if (!cxl_ncp_host_cache_read(ct2d->ncp_host_cache, dpa, size, data)) {
+            return MEMTX_ERROR;
+        }
+    } else if (ct2d->memsim.connected) {
+        if (!cxl_type2_memsim_request(ct2d, CXL_OP_READ, dpa, size,
+                                      NULL, &response)) {
+            return MEMTX_ERROR;
+        }
+        *data = 0;
+        memcpy(data, response.data, size);
+    } else {
+        memory = memory_region_get_ram_ptr(&ct2d->device_mem);
+        if (!memory) {
+            return MEMTX_ERROR;
+        }
+        *data = 0;
+        memcpy(data, memory + dpa, size);
+    }
+    if (ct2d->stats.hdm_reads++ == 0) {
+        qemu_log("CXL Type2: CXL.mem HDM read path active\n");
+    }
+    ct2d->stats.cpu_accesses++;
+    ct2d->stats.read_ops++;
+    return MEMTX_OK;
+}
+
+MemTxResult cxl_type2_write(PCIDevice *d, hwaddr host_addr, uint64_t data,
+                            unsigned size, MemTxAttrs attrs)
+{
+    CXLType2State *ct2d = CXL_TYPE2(d);
+    uint64_t dpa;
+    uint8_t *memory;
+
+    (void)attrs;
+    if (!cxl_type2_hpa_to_dpa(ct2d, host_addr, size, &dpa) ||
+        !cxl_type2_fabric_access_allowed(ct2d, dpa, size, true, false)) {
+        return MEMTX_ERROR;
+    }
+    if (ct2d->ncp_host_cache) {
+        if (!cxl_ncp_host_cache_write(ct2d->ncp_host_cache, dpa, size, data)) {
+            return MEMTX_ERROR;
+        }
+    } else if (ct2d->memsim.connected) {
+        if (!cxl_type2_memsim_request(ct2d, CXL_OP_WRITE, dpa, size,
+                                      (const uint8_t *)&data, NULL)) {
+            return MEMTX_ERROR;
+        }
+    } else {
+        memory = memory_region_get_ram_ptr(&ct2d->device_mem);
+        if (!memory) {
+            return MEMTX_ERROR;
+        }
+        memcpy(memory + dpa, &data, size);
+    }
+    ct2d->stats.hdm_writes++;
+    ct2d->stats.cpu_accesses++;
+    ct2d->stats.write_ops++;
+    return MEMTX_OK;
+}
+
 /* ========================================================================
  * DCD / GFAM / MH-SLD Fabric Memory Models
  * ======================================================================== */
